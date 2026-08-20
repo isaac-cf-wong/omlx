@@ -201,6 +201,62 @@ def _tiled_input_plan(
     return full_blocks, tail_rows
 
 
+_TAIL_OVERLAP_MIN_CACHE: int | None = None
+
+
+def _tail_overlap_min() -> int:
+    """Minimum tail rows before an overlapping ANE tile beats the GPU tail.
+
+    Resolved once and cached: this runs on every accelerated MLP and GDN call of
+    every layer, and an ``os.environ`` lookup per call measured as a ~1.6%
+    prefill regression on short prompts, where there is little work to amortize
+    it against.
+
+    A wide prefill splits into ``full_blocks`` fixed-shape ANE tiles plus a
+    residual tail that runs on the ordinary quantized linears. The tail is pure
+    GPU work, so a long tail caps the achievable prefill rate: measured on an
+    M4 Pro, ANE-covered rows run at about 118 tok/s against about 83 tok/s for
+    GPU rows, so an 8K prompt at shape 1024 (7 tiles, 911-row tail, ~89%
+    coverage) lands at ~112 tok/s against ~120 for full coverage.
+
+    The tail can instead be covered by re-running the *last* ``sequence_length``
+    rows as a full ANE tile and keeping only its last ``tail_rows`` outputs.
+    Both accelerated ops -- the MLP gate/up/down chain and the GDN input
+    projections -- are position-wise, so recomputing rows that an earlier tile
+    already produced is redundant work rather than incorrect work. This is not
+    the padding approach the module rejects elsewhere: no synthetic tokens enter
+    the prompt, no KV or recurrent state advances; only existing rows are
+    re-projected.
+
+    The trade is one full tile (``sequence_length / ane_rate``) against the tail
+    on GPU (``tail_rows / gpu_rate``), so it pays when
+    ``tail_rows > sequence_length * gpu_rate / ane_rate`` -- about 720 rows for a
+    1024 shape on this hardware. Set
+    ``OMLX_QWEN35_ANE_TAIL_OVERLAP_MIN=720`` to enable; 0 (default) keeps the
+    GPU tail.  720 is an M4 Pro heuristic: the break-even moves with the ANE and
+    GPU-suffix rates, so CPU sharing, dual-ANE mode, quantization and the
+    compiled shape all shift it, and it is a candidate for derivation from the
+    split tuner's measurements rather than a constant.
+    """
+    global _TAIL_OVERLAP_MIN_CACHE
+    if _TAIL_OVERLAP_MIN_CACHE is None:
+        try:
+            # negative values would otherwise enable the overlap for every tail,
+            # including the short ones the break-even explicitly rejects
+            _TAIL_OVERLAP_MIN_CACHE = max(
+                0, int(os.environ.get("OMLX_QWEN35_ANE_TAIL_OVERLAP_MIN", "0"))
+            )
+        except ValueError:
+            _TAIL_OVERLAP_MIN_CACHE = 0
+    return _TAIL_OVERLAP_MIN_CACHE
+
+
+def _reset_tail_overlap_min_cache() -> None:
+    """Drop the cached threshold. For tests that vary the environment."""
+    global _TAIL_OVERLAP_MIN_CACHE
+    _TAIL_OVERLAP_MIN_CACHE = None
+
+
 def _tail_qmm_or_linear(linear: Any, x: mx.array, variant: int) -> mx.array:
     # Wide-tile tails follow the same routing thresholds as the non-ANE
     # prefill fallback: the native qmm only pays off from the patch's
@@ -1296,13 +1352,21 @@ def _gdn_backend(
         projected.append(output)
 
     if tail_rows:
-        tail_x = x[:, full_blocks * config.sequence_length :, :]
-        projected.append(
-            tuple(
+        tail_parts = None
+        overlap_min = _tail_overlap_min()
+        if overlap_min and tail_rows >= overlap_min:
+            overlap_x = mx.contiguous(x[:, rows - config.sequence_length :, :])
+            overlap_out = _gdn_backend_exact(gdn, overlap_x, target_verify)
+            if overlap_out is not None:
+                keep = config.sequence_length - tail_rows
+                tail_parts = tuple(part[:, keep:, :] for part in overlap_out)
+        if tail_parts is None:
+            tail_x = x[:, full_blocks * config.sequence_length :, :]
+            tail_parts = tuple(
                 _tail_qmm_or_linear(linear, tail_x, config.variant)
                 for linear in _gdn_linears(gdn)
             )
-        )
+        projected.append(tail_parts)
 
     return tuple(
         mx.concatenate([part[index] for part in projected], axis=-2)
@@ -1575,12 +1639,21 @@ def _backend(
         outputs.append(output)
 
     if tail_rows:
-        tail_x = x[:, full_blocks * config.sequence_length :, :]
-        gate = _tail_qmm_or_linear(mlp.gate_proj, tail_x, config.variant)
-        up = _tail_qmm_or_linear(mlp.up_proj, tail_x, config.variant)
-        outputs.append(
-            _tail_qmm_or_linear(mlp.down_proj, swiglu(gate, up), config.variant)
-        )
+        tail_out = None
+        overlap_min = _tail_overlap_min()
+        if overlap_min and tail_rows >= overlap_min:
+            overlap_x = mx.contiguous(x[:, rows - config.sequence_length :, :])
+            overlap_out = _backend_exact(mlp, overlap_x, target_verify)
+            if overlap_out is not None:
+                tail_out = overlap_out[:, config.sequence_length - tail_rows :, :]
+        if tail_out is None:
+            tail_x = x[:, full_blocks * config.sequence_length :, :]
+            gate = _tail_qmm_or_linear(mlp.gate_proj, tail_x, config.variant)
+            up = _tail_qmm_or_linear(mlp.up_proj, tail_x, config.variant)
+            tail_out = _tail_qmm_or_linear(
+                mlp.down_proj, swiglu(gate, up), config.variant
+            )
+        outputs.append(tail_out)
     return mx.concatenate(outputs, axis=-2)
 
 
