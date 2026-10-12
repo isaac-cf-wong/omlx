@@ -18,7 +18,9 @@ previous ``__call__`` for prefill. The class patches therefore install before
 the target loads: dflash's hooks then wrap them, and
 ``restore_dflash_class_patches`` restores them rather than dropping them. The
 ANE split compiles slices from the loaded model, so it runs after the load on
-the MLX executor thread.
+the MLX executor thread. dflash-mlx's block and tree verification cannot pass
+``target_verify`` the way the batched and MTP paths do, so it runs with ANE
+suspended.
 
 Each piece is gated by the same per-model setting as on the batched engines,
 and the ANE arguments come from ``qwen35_ane_prefill_kwargs``, so a tuned
@@ -94,6 +96,7 @@ def enable_dflash_qwen35_ane(
     model: Any,
     model_settings: Any,
     model_type: str | None,
+    target_ops: Any,
     *,
     prefill_step_size: int,
 ) -> int:
@@ -102,7 +105,8 @@ def enable_dflash_qwen35_ane(
     Runs on the MLX executor thread after ``load_target_bundle``. Returns the
     number of MLP layers served on ANE; 0 when ANE prefill is off, unsupported
     for ``model_type``, or fails to compile, in which case prefill stays on
-    the GPU.
+    the GPU. When any slice compiles, ``target_ops``' verification runs with
+    ANE suspended.
     """
     from ..model_settings import ane_prefill_backend, validate_ane_prefill
 
@@ -128,6 +132,8 @@ def enable_dflash_qwen35_ane(
         return 0
 
     gdn_count = int(getattr(model, "_omlx_ane_gdn_prefill_count", 0) or 0)
+    if count or gdn_count:
+        keep_dflash_verify_off_ane(target_ops)
     sequence_length = kwargs["sequence_length"]
     if (count or gdn_count) and sequence_length > prefill_step_size:
         # dflash-mlx prefills in prefill_step_size chunks and never widens
@@ -147,6 +153,30 @@ def enable_dflash_qwen35_ane(
         prefill_step_size,
     )
     return count
+
+
+def keep_dflash_verify_off_ane(target_ops: Any) -> None:
+    """Run ``target_ops``' block and tree verification with ANE suspended.
+
+    The batched and MTP verify paths pass ``target_verify`` to keep their
+    forwards off ANE; dflash-mlx's verification cannot. Its blocks are far
+    shorter than an ANE tile, but a ``tail_padding_min_tokens`` at or below the
+    block size would pad them onto the approximate route. The methods are
+    wrapped on this instance; dflash-mlx builds a fresh one per load.
+    """
+    from .qwen35_ane_prefill import suspend_qwen35_ane_prefill
+
+    for name in ("verify_block", "verify_tree_block"):
+        method = getattr(target_ops, name, None)
+        if method is None or getattr(method, "_omlx_ane_suspended", False):
+            continue
+
+        def suspended(*args, _method=method, **kwargs):
+            with suspend_qwen35_ane_prefill():
+                return _method(*args, **kwargs)
+
+        suspended._omlx_ane_suspended = True
+        setattr(target_ops, name, suspended)
 
 
 def release_dflash_qwen35_ane(model: Any) -> None:

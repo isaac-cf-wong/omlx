@@ -13,7 +13,9 @@ import logging
 import threading
 import time
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -30,6 +32,11 @@ _PATCHED_CLASSES: set[type] = set()
 _VLM_HOOK_INSTALLED = False
 _VLM_GDN_HOOK_INSTALLED = False
 _GDN_MODULES: weakref.WeakValueDictionary[int, Any] = weakref.WeakValueDictionary()
+# Set while a caller that cannot pass target_verify (DFlash verification) runs
+# a forward that must stay on the checkpoint-precision projections.
+_ANE_PREFILL_SUSPENDED: ContextVar[bool] = ContextVar(
+    "omlx_ane_prefill_suspended", default=False
+)
 # Legacy extensions compile one program per slice, and the private runtime on
 # the reference M3 Ultra accepts 120 resident programs. Current extensions pack
 # all slices into one multi-procedure program per ANE instance and bypass this
@@ -1665,6 +1672,21 @@ def _gdn_backend_exact(
         return None
 
 
+@contextmanager
+def suspend_qwen35_ane_prefill() -> Iterator[None]:
+    """Keep forwards in this context off the ANE prefill slices.
+
+    For verification forwards whose caller cannot pass ``target_verify``: a
+    short block would otherwise reach the approximate ANE route through tail
+    padding when ``tail_padding_min_tokens`` is at or below its row count.
+    """
+    token = _ANE_PREFILL_SUSPENDED.set(True)
+    try:
+        yield
+    finally:
+        _ANE_PREFILL_SUSPENDED.reset(token)
+
+
 def _gdn_backend(
     gdn: Any, x: mx.array, target_verify: bool = False
 ) -> tuple[mx.array, mx.array, mx.array, mx.array] | None:
@@ -1676,7 +1698,7 @@ def _gdn_backend(
     original GPU operation.
     """
     config = getattr(gdn, "_omlx_ane_gdn_config", None)
-    if config is None or target_verify:
+    if config is None or target_verify or _ANE_PREFILL_SUSPENDED.get():
         return None
     input_dim = int(x.shape[-1]) if x.ndim else 0
     rows = int(x.size // input_dim) if input_dim else 0
@@ -2021,7 +2043,7 @@ def _backend(
     complete fixed-shape tile fall through to the original wide GPU operation.
     """
     config = getattr(mlp, "_omlx_ane_prefill_config", None)
-    if config is None or target_verify:
+    if config is None or target_verify or _ANE_PREFILL_SUSPENDED.get():
         return None
     input_dim = int(x.shape[-1]) if x.ndim else 0
     rows = int(x.size // input_dim) if input_dim else 0
