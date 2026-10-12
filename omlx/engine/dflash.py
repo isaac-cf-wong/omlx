@@ -777,6 +777,15 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
             install_dflash_lifecycle_wrap()
 
+            # Before the target loads, so dflash's class hooks wrap these
+            # patches and its lifecycle restore keeps them.
+            from ..patches.dflash_qwen35_accel import (
+                enable_dflash_qwen35_ane,
+                install_dflash_qwen35_class_patches,
+            )
+
+            install_dflash_qwen35_class_patches(self._model_settings)
+
             quantize_kv_cache = bool(
                 getattr(runtime_context.runtime, "quantize_kv_cache", False)
             )
@@ -821,6 +830,20 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                         "DFlash target MoE gate+up fusion not applied",
                         exc_info=True,
                     )
+
+            target_config = target_bundle.meta.get("config", {})
+            enable_dflash_qwen35_ane(
+                target_bundle.model,
+                self._model_settings,
+                (
+                    target_config.get("model_type")
+                    if isinstance(target_config, dict)
+                    else getattr(target_config, "model_type", None)
+                ),
+                prefill_step_size=int(
+                    getattr(runtime_context.runtime, "prefill_step_size", 0) or 2048
+                ),
+            )
             draft, draft_meta = load_draft_bundle(
                 self._draft_model_path,
                 draft_quant=(
@@ -1041,6 +1064,25 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         except Exception as exc:
             logger.debug(f"dflash cache end_request failed: {exc}")
 
+    async def _release_target_ane(self) -> None:
+        """Free the target's ANE prefill banks before dropping the target.
+
+        The engine pool's release only finds ``_model``/``_vlm_model``, so the
+        DFlash target's banks are released here.
+        """
+        if self._target_model is None:
+            return
+        from ..engine_core import get_mlx_executor
+        from ..patches.dflash_qwen35_accel import release_dflash_qwen35_ane
+
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                get_mlx_executor(), release_dflash_qwen35_ane, self._target_model
+            )
+        except Exception:
+            # Teardown must still drop the target; GC reclaims the banks.
+            logger.warning("DFlash ANE prefill release failed", exc_info=True)
+
     async def _evict_dflash_and_start_fallback(self) -> None:
         """Evict dflash models from memory, verify release, then start fallback engine."""
         from dflash_mlx.cache.manager import shutdown_runtime_cache_manager
@@ -1056,6 +1098,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
         # Release dflash model and cache references
         await loop.run_in_executor(get_mlx_executor(), shutdown_runtime_cache_manager)
+        await self._release_target_ane()
         self._dflash_prefix_cache = None
         self._runtime_context = None
         self._target_model = None
@@ -1145,6 +1188,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             )
         except Exception as exc:
             logger.debug(f"shutdown_runtime_cache_manager: {exc}")
+        await self._release_target_ane()
         self._dflash_prefix_cache = None
         self._runtime_context = None
         self._target_model = None

@@ -449,7 +449,11 @@ class TestDFlashEngineInit:
 
             from omlx.engine import dflash as dflash_mod
             from omlx.engine.dflash import DFlashEngine
-            from omlx.patches import dflash_lifecycle, qwen35_moe_gate_up
+            from omlx.patches import (
+                dflash_lifecycle,
+                dflash_qwen35_accel,
+                qwen35_moe_gate_up,
+            )
         except ImportError:
             pytest.skip("dflash-mlx not installed")
 
@@ -493,6 +497,12 @@ class TestDFlashEngineInit:
             dflash_lifecycle,
             "install_dflash_lifecycle_wrap",
             lambda: True,
+        )
+        # The real installers patch process-global SDPA routes.
+        monkeypatch.setattr(
+            dflash_qwen35_accel,
+            "install_dflash_qwen35_class_patches",
+            lambda settings: {},
         )
         monkeypatch.setattr(
             qwen35_moe_gate_up,
