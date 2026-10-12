@@ -3049,6 +3049,51 @@ def _enable_fused_gdn_banks(
     return len(prepared), resident_programs
 
 
+def qwen35_ane_prefill_kwargs(
+    model_settings: Any, model_type: str | None
+) -> dict[str, Any]:
+    """Map per-model settings onto ``enable_qwen35_ane_prefill`` arguments.
+
+    Every engine that serves a Qwen ANE prefill builds its call from here, so a
+    profile the tuner saves reaches each engine the same way.
+    """
+    from ..model_settings import ane_prefill_fraction
+
+    def setting(name: str, default: Any) -> Any:
+        return getattr(model_settings, name, default)
+
+    fraction = ane_prefill_fraction(
+        setting("qwen35_ane_prefill_fraction", None), model_type
+    )
+    fused_down = setting("qwen35_ane_prefill_fused_down", False)
+    cpu_enabled = setting("qwen35_ane_prefill_cpu_enabled", False)
+    return {
+        "sequence_length": int(setting("qwen35_ane_prefill_sequence_length", 2048)),
+        "tail_padding_min_tokens": int(
+            setting("qwen35_ane_prefill_tail_padding_min_tokens", 0) or 0
+        ),
+        "fraction": fraction,
+        "max_layers": setting("qwen35_ane_prefill_max_layers", 64),
+        "gdn": setting("qwen35_ane_prefill_gdn", True),
+        "gdn_fraction": setting("qwen35_ane_prefill_gdn_fraction", 0.50),
+        "gdn_max_layers": setting("qwen35_ane_prefill_gdn_max_layers", 48),
+        "dual_ane": setting("qwen35_ane_prefill_dual_ane", True),
+        "ane_down_fraction": fraction if fused_down else 0.0,
+        "fused_down": fused_down,
+        "cpu_fraction": (
+            setting("qwen35_ane_prefill_cpu_fraction", 0.135) if cpu_enabled else 0.0
+        ),
+        "cpu_down_fraction": (
+            setting("qwen35_ane_prefill_cpu_down_fraction", 0.0) if cpu_enabled else 0.0
+        ),
+        "cpu_gdn_fraction": (
+            setting("qwen35_ane_prefill_cpu_gdn_fraction", 0.0) if cpu_enabled else 0.0
+        ),
+        "cpu_threads": setting("qwen35_ane_prefill_cpu_threads", 8),
+        "cpu_shared_resource": setting("qwen35_ane_prefill_cpu_shared_resource", True),
+    }
+
+
 def enable_qwen35_ane_prefill(
     model: Any,
     *,
