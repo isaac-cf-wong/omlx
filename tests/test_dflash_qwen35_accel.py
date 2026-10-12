@@ -84,6 +84,91 @@ class TestAnePrefillKwargs:
         assert set(_TUNED_KWARGS) <= set(params)
 
 
+class _VerifyOps:
+    """Records whether ANE was suspended while each target op ran."""
+
+    def __init__(self):
+        self.seen = []
+
+    def _record(self, name):
+        self.seen.append((name, qwen35_ane_prefill._ANE_PREFILL_SUSPENDED.get()))
+        return name
+
+    def verify_block(self, **kwargs):
+        return self._record("verify_block")
+
+    def verify_tree_block(self, **kwargs):
+        return self._record("verify_tree_block")
+
+    def prefill(self, **kwargs):
+        return self._record("prefill")
+
+
+def _ane_module(attr, sequence_length=1024, tail_padding_min_tokens=16):
+    config = SimpleNamespace(
+        sequence_length=sequence_length,
+        tail_padding_min_tokens=tail_padding_min_tokens,
+    )
+    return SimpleNamespace(**{attr: config})
+
+
+class TestAneSuspension:
+    """A 16-row verify block pads onto ANE once the threshold reaches 16."""
+
+    def test_mlp_verify_block_stays_off_ane_while_suspended(self, monkeypatch):
+        import mlx.core as mx
+
+        monkeypatch.setattr(
+            qwen35_ane_prefill,
+            "_backend_exact",
+            lambda mlp, x, target_verify: mx.ones(x.shape, dtype=x.dtype),
+        )
+        mlp = _ane_module("_omlx_ane_prefill_config")
+        block = mx.zeros((1, 16, 8), dtype=mx.float16)
+
+        assert qwen35_ane_prefill._backend(mlp, block).shape == (1, 16, 8)
+        with qwen35_ane_prefill.suspend_qwen35_ane_prefill():
+            assert qwen35_ane_prefill._backend(mlp, block) is None
+        assert qwen35_ane_prefill._backend(mlp, block) is not None
+
+    def test_gdn_verify_block_stays_off_ane_while_suspended(self, monkeypatch):
+        import mlx.core as mx
+
+        monkeypatch.setattr(
+            qwen35_ane_prefill,
+            "_gdn_backend_exact",
+            lambda gdn, x, target_verify: tuple(
+                mx.ones(x.shape, dtype=x.dtype) for _ in range(4)
+            ),
+        )
+        gdn = _ane_module("_omlx_ane_gdn_config")
+        block = mx.zeros((1, 16, 8), dtype=mx.float16)
+
+        assert qwen35_ane_prefill._gdn_backend(gdn, block) is not None
+        with qwen35_ane_prefill.suspend_qwen35_ane_prefill():
+            assert qwen35_ane_prefill._gdn_backend(gdn, block) is None
+
+    def test_dflash_verification_runs_suspended(self):
+        ops = _VerifyOps()
+        accel.keep_dflash_verify_off_ane(ops)
+        accel.keep_dflash_verify_off_ane(ops)
+
+        assert ops.verify_block(verify_ids=None) == "verify_block"
+        ops.verify_tree_block(tree_inputs=None)
+        ops.prefill()
+        assert ops.seen == [
+            ("verify_block", True),
+            ("verify_tree_block", True),
+            ("prefill", False),
+        ]
+
+    def test_ops_without_tree_verify_are_wrapped(self):
+        ops = SimpleNamespace(verify_block=lambda: "ok")
+        accel.keep_dflash_verify_off_ane(ops)
+        assert ops.verify_block() == "ok"
+        assert not hasattr(ops, "verify_tree_block")
+
+
 @pytest.fixture
 def captured_enable(monkeypatch):
     calls = []
@@ -100,22 +185,32 @@ def captured_enable(monkeypatch):
 class TestEnableDflashAne:
     def test_tuned_profile_reaches_the_dflash_target(self, captured_enable):
         model = SimpleNamespace()
+        ops = _VerifyOps()
         count = accel.enable_dflash_qwen35_ane(
-            model, ModelSettings(**_TUNED), "qwen3_5", prefill_step_size=2048
+            model, ModelSettings(**_TUNED), "qwen3_5", ops, prefill_step_size=2048
         )
         assert count == 5
         assert captured_enable == [(model, _TUNED_KWARGS)]
+        ops.verify_block()
+        assert ops.seen == [("verify_block", True)]
 
     def test_off_by_default(self, captured_enable):
+        ops = _VerifyOps()
         count = accel.enable_dflash_qwen35_ane(
-            SimpleNamespace(), ModelSettings(), "qwen3_5", prefill_step_size=2048
+            SimpleNamespace(), ModelSettings(), "qwen3_5", ops, prefill_step_size=2048
         )
         assert count == 0
         assert captured_enable == []
+        ops.verify_block()
+        assert ops.seen == [("verify_block", False)]
 
     def test_non_qwen_target_is_skipped(self, captured_enable):
         count = accel.enable_dflash_qwen35_ane(
-            SimpleNamespace(), ModelSettings(**_TUNED), "gemma4", prefill_step_size=2048
+            SimpleNamespace(),
+            ModelSettings(**_TUNED),
+            "gemma4",
+            _VerifyOps(),
+            prefill_step_size=2048,
         )
         assert count == 0
         assert captured_enable == []
@@ -126,7 +221,11 @@ class TestEnableDflashAne:
         )
         with caplog.at_level(logging.WARNING):
             count = accel.enable_dflash_qwen35_ane(
-                SimpleNamespace(), settings, "qwen3_5", prefill_step_size=2048
+                SimpleNamespace(),
+                settings,
+                "qwen3_5",
+                _VerifyOps(),
+                prefill_step_size=2048,
             )
         assert count == 0
         assert captured_enable == []
@@ -142,6 +241,7 @@ class TestEnableDflashAne:
                 SimpleNamespace(),
                 ModelSettings(**_TUNED),
                 "qwen3_5",
+                _VerifyOps(),
                 prefill_step_size=2048,
             )
         assert count == 0
@@ -158,7 +258,11 @@ class TestEnableDflashAne:
         )
         with caplog.at_level(logging.WARNING):
             accel.enable_dflash_qwen35_ane(
-                SimpleNamespace(), settings, "qwen3_5", prefill_step_size=2048
+                SimpleNamespace(),
+                settings,
+                "qwen3_5",
+                _VerifyOps(),
+                prefill_step_size=2048,
             )
         assert ("exceeds the DFlash prefill step" in caplog.text) is warns
 
@@ -259,6 +363,7 @@ async def test_engine_installs_before_load_and_releases_on_stop(monkeypatch):
 
     events = []
     target = SimpleNamespace()
+    target_ops = SimpleNamespace()
 
     def fake_load_target_bundle(model_ref, **kwargs):
         events.append("load_target")
@@ -268,7 +373,7 @@ async def test_engine_installs_before_load_and_releases_on_stop(monkeypatch):
                 name_or_path="fake-target", eos_token_id=1, eos_token_ids=[1]
             ),
             meta={"config": {"model_type": "qwen3_5"}},
-            target_ops=SimpleNamespace(),
+            target_ops=target_ops,
         )
 
     class FakeDraft:
@@ -295,8 +400,8 @@ async def test_engine_installs_before_load_and_releases_on_stop(monkeypatch):
         lambda settings: events.append("class_patches") or {},
     )
 
-    def fake_enable(model, settings, model_type, *, prefill_step_size):
-        events.append(("ane", model, model_type, prefill_step_size))
+    def fake_enable(model, settings, model_type, target_ops, *, prefill_step_size):
+        events.append(("ane", model, model_type, target_ops, prefill_step_size))
         return 5
 
     monkeypatch.setattr(accel, "enable_dflash_qwen35_ane", fake_enable)
@@ -317,6 +422,6 @@ async def test_engine_installs_before_load_and_releases_on_stop(monkeypatch):
     assert events == [
         "class_patches",
         "load_target",
-        ("ane", target, "qwen3_5", 2048),
+        ("ane", target, "qwen3_5", target_ops, 2048),
         ("release", target),
     ]

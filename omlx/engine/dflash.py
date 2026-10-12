@@ -840,6 +840,7 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                     if isinstance(target_config, dict)
                     else getattr(target_config, "model_type", None)
                 ),
+                target_bundle.target_ops,
                 prefill_step_size=int(
                     getattr(runtime_context.runtime, "prefill_step_size", 0) or 2048
                 ),
