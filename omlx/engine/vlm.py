@@ -47,11 +47,13 @@ from ..api.utils import (
 )
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
-from ..model_settings import ane_prefill_backend
+from ..model_settings import ane_prefill_backend, ane_prefill_fraction
 from ..models.vlm import VLMModelAdapter
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
+from ..patches.mlx_lm_mtp import drafter_target
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
+from ..speculative.dflash import attach_drafter, detach_drafter
 from ..utils.image import (
     compute_image_hash,
     compute_per_image_hashes,
@@ -1859,7 +1861,7 @@ class VLMBatchedEngine(BaseEngine):
         # Phase 2A: attached but not yet wired into the decode path.
         self._vlm_mtp_drafter: Any | None = None
         # Holds the DFlash block drafter attached to Lightning MTP when
-        # dflash_enabled routes here instead of DFlashEngine.
+        # dflash_enabled.
         self._dflash_drafter: Any | None = None
         self._diffusion_family: str | None = None
         self._diffusion_lock = asyncio.Lock()
@@ -2326,20 +2328,116 @@ class VLMBatchedEngine(BaseEngine):
             getattr(self._model_settings, "qwen35_ane_prefill_enabled", False)
             and ane_prefill_backend(self.model_type) == "qwen"
         ):
+            ane_fraction = ane_prefill_fraction(
+                self._model_settings.qwen35_ane_prefill_fraction, self.model_type
+            )
             try:
-                from ..patches.qwen35_ane_prefill import (
-                    enable_qwen35_ane_prefill,
-                    qwen35_ane_prefill_kwargs,
-                )
+                from ..patches.qwen35_ane_prefill import enable_qwen35_ane_prefill
 
-                ane_kwargs = qwen35_ane_prefill_kwargs(
-                    self._model_settings, self.model_type
+                requested_ane_sequence_length = int(
+                    getattr(
+                        self._model_settings,
+                        "qwen35_ane_prefill_sequence_length",
+                        2048,
+                    )
                 )
-                requested_ane_sequence_length = ane_kwargs["sequence_length"]
 
                 def _enable_ane_prefill():
                     return enable_qwen35_ane_prefill(
-                        self._vlm_model, **ane_kwargs, install_dispatch=False
+                        self._vlm_model,
+                        sequence_length=requested_ane_sequence_length,
+                        tail_padding_min_tokens=int(
+                            getattr(
+                                self._model_settings,
+                                "qwen35_ane_prefill_tail_padding_min_tokens",
+                                0,
+                            )
+                            or 0
+                        ),
+                        fraction=ane_fraction,
+                        max_layers=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_max_layers",
+                            64,
+                        ),
+                        gdn=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_gdn",
+                            True,
+                        ),
+                        gdn_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_gdn_fraction",
+                            0.50,
+                        ),
+                        gdn_max_layers=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_gdn_max_layers",
+                            48,
+                        ),
+                        dual_ane=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_dual_ane",
+                            True,
+                        ),
+                        ane_down_fraction=(
+                            ane_fraction
+                            if getattr(
+                                self._model_settings,
+                                "qwen35_ane_prefill_fused_down",
+                                False,
+                            )
+                            else 0.0
+                        ),
+                        fused_down=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_fused_down",
+                            False,
+                        ),
+                        cpu_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_fraction",
+                            0.135,
+                        )
+                        if getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_enabled",
+                            False,
+                        )
+                        else 0.0,
+                        cpu_down_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_down_fraction",
+                            0.0,
+                        )
+                        if getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_enabled",
+                            False,
+                        )
+                        else 0.0,
+                        cpu_gdn_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_gdn_fraction",
+                            0.0,
+                        )
+                        if getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_enabled",
+                            False,
+                        )
+                        else 0.0,
+                        cpu_threads=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_threads",
+                            8,
+                        ),
+                        cpu_shared_resource=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_shared_resource",
+                            True,
+                        ),
+                        install_dispatch=False,
                     )
 
                 ane_count = await loop.run_in_executor(
@@ -2526,7 +2624,9 @@ class VLMBatchedEngine(BaseEngine):
 
             configure_qwen4_decode(
                 self._vlm_model,
-                wide_projections=scheduler_config.qwen4_gdn_decode_wide_proj,
+                wide_projections=bool(
+                    getattr(self._model_settings, "qwen4_gdn_decode_wide_proj", False)
+                ),
             )
             apply_qwen35_gdn_prework_patch()
         except Exception:
@@ -2790,10 +2890,19 @@ class VLMBatchedEngine(BaseEngine):
         """The loaded mlx-vlm model (target for external drafters)."""
         return self._vlm_model
 
+    def prepare_dflash_target(self) -> Any:
+        """Return the model a DFlash drafter binds to, ready for captures.
+
+        Language models without speculative rollback (Muse Glimmer) gain
+        layer captures and rollback here, before the drafter binds.
+        """
+        language_model = self._vlm_model.language_model
+        if not hasattr(language_model, "rollback_speculative_cache"):
+            drafter_target.apply(language_model)
+        return self._vlm_model
+
     def set_dflash_drafter(self, drafter: Any) -> None:
         """Attach a DFlash block drafter to the Lightning MTP decode path."""
-        from ..speculative.dflash_drafter import attach_drafter
-
         language_model = getattr(self._adapter, "_language_model", None)
         if language_model is None:
             raise RuntimeError("VLM engine has no language model for the drafter")
@@ -2835,6 +2944,9 @@ class VLMBatchedEngine(BaseEngine):
         # pass has already run. Mark unloaded first: the scheduler is no longer
         # reachable once _engine is cleared.
         self._loaded = False
+        language_model = getattr(self._adapter, "_language_model", None)
+        if self._dflash_drafter is not None and language_model is not None:
+            detach_drafter(language_model)
         _clear_teardown_references(
             self,
             none_attrs=(
@@ -4718,6 +4830,8 @@ class VLMBatchedEngine(BaseEngine):
             xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
             repetition_context_size=kwargs.get("repetition_context_size"),
+            no_repeat_ngram_size=kwargs.get("no_repeat_ngram_size", 0),
+            ngram_window=kwargs.get("ngram_window", 0),
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
@@ -4726,6 +4840,7 @@ class VLMBatchedEngine(BaseEngine):
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
             stop_skips_reasoning=kwargs.get("stop_skips_reasoning", False),
+            logits_observer=kwargs.get("logits_observer"),
         )
 
         # SpecPrefill: forward per-request overrides to the engine, mirroring
@@ -4833,6 +4948,8 @@ class VLMBatchedEngine(BaseEngine):
             xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
             repetition_context_size=kwargs.get("repetition_context_size"),
+            no_repeat_ngram_size=kwargs.get("no_repeat_ngram_size", 0),
+            ngram_window=kwargs.get("ngram_window", 0),
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
@@ -4841,6 +4958,7 @@ class VLMBatchedEngine(BaseEngine):
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
             stop_skips_reasoning=kwargs.get("stop_skips_reasoning", False),
+            logits_observer=kwargs.get("logits_observer"),
         )
 
         # SpecPrefill: pass per-request overrides
@@ -5458,6 +5576,11 @@ class VLMBatchedEngine(BaseEngine):
             raise InvalidRequestError(
                 "SpecPrefill is not supported with diffusion models.",
                 field="specprefill",
+            )
+        if kwargs.get("no_repeat_ngram_size"):
+            raise InvalidRequestError(
+                "no_repeat_ngram_size is not supported with diffusion models.",
+                field="no_repeat_ngram_size",
             )
 
     def _diffusion_apply_chat_template(

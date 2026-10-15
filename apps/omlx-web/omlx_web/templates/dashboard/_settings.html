@@ -187,6 +187,18 @@
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm font-medium text-red-700">{{ t('settings.auth.keyless_inference') }}</label>
+                                        <p class="text-xs text-red-600 mt-0.5">{{ t('settings.auth.keyless_inference_hint') }}</p>
+                                    </div>
+                                    <button type="button" @click="toggleUnauthenticatedInference()"
+                                            :class="globalSettings.auth.allow_unauthenticated_inference ? 'bg-red-600' : 'bg-neutral-200'"
+                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500">
+                                        <span :class="globalSettings.auth.allow_unauthenticated_inference ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
                                 <!-- Sub Keys Section -->
                                 <div class="px-6 py-4">
                                     <div class="flex items-center justify-between mb-3">
@@ -1021,19 +1033,6 @@
                                         </div>
                                         <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                             <div class="flex-1">
-                                                <label class="text-sm text-neutral-700">{{ t('settings.advanced.qwen4_gdn_decode_wide_proj') }}</label>
-                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.qwen4_gdn_decode_wide_proj_hint') }}</p>
-                                            </div>
-                                            <button type="button"
-                                                    @click="globalSettings.server.qwen4_gdn_decode_wide_proj = !globalSettings.server.qwen4_gdn_decode_wide_proj"
-                                                    :class="globalSettings.server.qwen4_gdn_decode_wide_proj ? 'bg-black' : 'bg-neutral-200'"
-                                                    class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
-                                                <span :class="globalSettings.server.qwen4_gdn_decode_wide_proj ? 'translate-x-5' : 'translate-x-0'"
-                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
-                                            </button>
-                                        </div>
-                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
-                                            <div class="flex-1">
                                                 <label class="text-sm text-neutral-700">{{ t('settings.advanced.preserve_mid_system_cache') }}</label>
                                                 <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.preserve_mid_system_cache_hint') }}</p>
                                             </div>
@@ -1782,11 +1781,11 @@
                                                   @mouseleave="hideTip()"
                                                   x-text="window.t('settings.models.table.hidden_badge')"></span>
                                             <button x-data="{ copied: false }"
-                                                    @click.stop="copyToClipboard(model.id); copied = true; setTimeout(() => copied = false, 2000)"
+                                                    @click.stop="copyToClipboard(apiModelName(model.id)); copied = true; setTimeout(() => copied = false, 2000)"
                                                     class="p-1 rounded-md transition-all flex-shrink-0"
                                                     :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
-                                                    :title="window.t('settings.models.table.copy_model_name_tooltip')"
-                                                <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                                    :title="window.t('settings.models.table.copy_model_name_tooltip')">
+                                                    <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
                                                 <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
                                             </button>
                                         </div>

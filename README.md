@@ -318,7 +318,7 @@ Models are auto-detected by type. You can also download models directly from the
 | OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
 | Embedding | BERT, BGE-M3, ModernBERT, EmbeddingGemma 2 |
 | Reranker | ModernBERT, XLM-RoBERTa |
-| Decision | Clef, Clef-Flash, OpenJev |
+| Decision | Clef, Clef-Flash, OpenJev, Decision 3.0 (d3, d3-flash, d3-mini, d3-nano, d3-lite, d3-edge) |
 
 ## CLI Configuration
 
@@ -367,9 +367,9 @@ The default SSD cache limit, `auto`, uses 50% of the sum of free disk space and 
 
 
 Most settings can also be configured from the web admin panel at `/admin`. Settings are persisted to `~/.omlx/settings.json`, and CLI flags take precedence.
-Set the main API key before changing the server host to a LAN address or `0.0.0.0`, or save both settings together. oMLX refuses to start on any non-loopback address without a main API key. The existing `skip_api_key_verification` option remains restricted to loopback-only binds.
+Set the main API key before changing the server host to a LAN address or `0.0.0.0`, or save both settings together. oMLX refuses to start on any non-loopback address without a main API key. "Disable all authentication" (`skip_api_key_verification`) turns off both inference and admin authentication, so it stays restricted to loopback-only binds.
 
-For keyless inference, stop oMLX, manually set `auth.allow_unauthenticated_inference` to `true` in `settings.json`, and restart. It defaults to `false` and has no UI toggle. This allows anyone who can reach the server to use inference (including stored Responses and audio), MCP tools, and web search. On network binds, keep a main API key configured and `skip_api_key_verification` set to `false`; management endpoints still require authentication.
+For keyless inference on a network bind, turn on "Allow inference without API key" in the web admin settings or the Security screen of the macOS app. It sets `auth.allow_unauthenticated_inference`, defaults to `false`, and applies without a restart. This allows anyone who can reach the server to use inference (including stored Responses and audio), MCP tools, and web search. Management endpoints still require the main API key or an admin login.
 
 <details>
 <summary>Architecture</summary>

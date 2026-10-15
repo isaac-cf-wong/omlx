@@ -20,7 +20,9 @@ from ..model_settings import (
     ane_prefill_fraction,
     validate_ane_prefill,
 )
+from ..patches.mlx_lm_mtp import drafter_target
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
+from ..speculative.dflash import attach_drafter, detach_drafter
 from ..utils.tokenizer import get_tokenizer_config
 from .base import (
     BaseEngine,
@@ -98,6 +100,7 @@ class BatchedEngine(BaseEngine):
         self._tokenizer = None
         self._engine = None
         self._loaded = False
+        self._dflash_drafter: Any | None = None
         self._grammar_compiler = None
         self._grammar_compiler_init_attempted = False
 
@@ -547,18 +550,112 @@ class BatchedEngine(BaseEngine):
         ane_prefill_sequence_length = 0
         if ane_enabled and ane_backend == "qwen":
             try:
-                from ..patches.qwen35_ane_prefill import (
-                    enable_qwen35_ane_prefill,
-                    qwen35_ane_prefill_kwargs,
-                )
+                from ..patches.qwen35_ane_prefill import enable_qwen35_ane_prefill
 
-                ane_kwargs = qwen35_ane_prefill_kwargs(
-                    self._model_settings, self.model_type
+                requested_ane_sequence_length = int(
+                    getattr(
+                        self._model_settings,
+                        "qwen35_ane_prefill_sequence_length",
+                        2048,
+                    )
                 )
-                requested_ane_sequence_length = ane_kwargs["sequence_length"]
 
                 def _enable_ane_prefill():
-                    return enable_qwen35_ane_prefill(self._model, **ane_kwargs)
+                    return enable_qwen35_ane_prefill(
+                        self._model,
+                        sequence_length=requested_ane_sequence_length,
+                        tail_padding_min_tokens=int(
+                            getattr(
+                                self._model_settings,
+                                "qwen35_ane_prefill_tail_padding_min_tokens",
+                                0,
+                            )
+                            or 0
+                        ),
+                        fraction=ane_fraction,
+                        max_layers=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_max_layers",
+                            64,
+                        ),
+                        gdn=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_gdn",
+                            True,
+                        ),
+                        gdn_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_gdn_fraction",
+                            0.50,
+                        ),
+                        gdn_max_layers=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_gdn_max_layers",
+                            48,
+                        ),
+                        dual_ane=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_dual_ane",
+                            True,
+                        ),
+                        ane_down_fraction=(
+                            ane_fraction
+                            if getattr(
+                                self._model_settings,
+                                "qwen35_ane_prefill_fused_down",
+                                False,
+                            )
+                            else 0.0
+                        ),
+                        fused_down=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_fused_down",
+                            False,
+                        ),
+                        cpu_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_fraction",
+                            0.135,
+                        )
+                        if getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_enabled",
+                            False,
+                        )
+                        else 0.0,
+                        cpu_down_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_down_fraction",
+                            0.0,
+                        )
+                        if getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_enabled",
+                            False,
+                        )
+                        else 0.0,
+                        cpu_gdn_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_gdn_fraction",
+                            0.0,
+                        )
+                        if getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_enabled",
+                            False,
+                        )
+                        else 0.0,
+                        cpu_threads=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_threads",
+                            8,
+                        ),
+                        cpu_shared_resource=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_shared_resource",
+                            True,
+                        ),
+                    )
 
                 ane_count = await loop.run_in_executor(
                     get_mlx_executor(),
@@ -714,6 +811,35 @@ class BatchedEngine(BaseEngine):
         self._loaded = True
         logger.info(f"BatchedEngine loaded: {self._model_name}")
 
+    def _dflash_host(self) -> Any:
+        return getattr(self._model, "language_model", self._model)
+
+    def prepare_dflash_target(self) -> Any:
+        """Return the model a DFlash drafter binds to, ready for captures.
+
+        Plain-attention models without speculative rollback (Qwen3, Laguna)
+        gain layer captures and rollback here, before the drafter binds.
+        """
+        if not hasattr(self._dflash_host(), "rollback_speculative_cache"):
+            drafter_target.apply(self._dflash_host())
+        return self._model
+
+    def set_dflash_drafter(self, drafter: Any) -> None:
+        """Attach a DFlash block drafter to the Lightning MTP decode path."""
+        attach_drafter(self._dflash_host(), drafter)
+        self._dflash_drafter = drafter
+        logger.info(
+            "DFlash drafter attached to engine: %s (kind=%s, block=%d, layers=%s)",
+            self._model_name,
+            drafter.kind,
+            drafter.block_size,
+            drafter.target_layer_ids,
+        )
+
+    @property
+    def dflash_drafter(self) -> Any | None:
+        return self._dflash_drafter
+
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
         cancelled = False
@@ -747,6 +873,8 @@ class BatchedEngine(BaseEngine):
                 logger.warning(
                     "ANE prefill state release failed during stop", exc_info=True
                 )
+        if self._dflash_drafter is not None and self._model is not None:
+            detach_drafter(self._dflash_host())
         _clear_teardown_references(
             self,
             none_attrs=(
@@ -754,6 +882,7 @@ class BatchedEngine(BaseEngine):
                 "_model",
                 "_tokenizer",
                 "_grammar_compiler",
+                "_dflash_drafter",
             ),
             false_attrs=("_grammar_compiler_init_attempted",),
         )
@@ -1037,6 +1166,8 @@ class BatchedEngine(BaseEngine):
             xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
             repetition_context_size=kwargs.get("repetition_context_size"),
+            no_repeat_ngram_size=kwargs.get("no_repeat_ngram_size", 0),
+            ngram_window=kwargs.get("ngram_window", 0),
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
@@ -1044,6 +1175,7 @@ class BatchedEngine(BaseEngine):
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
             stop_skips_reasoning=kwargs.get("stop_skips_reasoning", False),
+            logits_observer=kwargs.get("logits_observer"),
         )
 
         # SpecPrefill: forward per-request overrides to the engine, mirroring
@@ -1118,6 +1250,8 @@ class BatchedEngine(BaseEngine):
             xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
             repetition_context_size=kwargs.get("repetition_context_size"),
+            no_repeat_ngram_size=kwargs.get("no_repeat_ngram_size", 0),
+            ngram_window=kwargs.get("ngram_window", 0),
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
@@ -1125,6 +1259,7 @@ class BatchedEngine(BaseEngine):
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
             stop_skips_reasoning=kwargs.get("stop_skips_reasoning", False),
+            logits_observer=kwargs.get("logits_observer"),
         )
 
         # SpecPrefill: pass per-request overrides to engine
