@@ -318,9 +318,13 @@ class DFlashDrafter:
         if end is None or end > len(tokens):
             return
         context = history[0] if len(history) == 1 else mx.concatenate(history, axis=1)
+        if int(context.shape[1]) > self.ring_slots:
+            context = mx.contiguous(context[:, -self.ring_slots :])
+        # A lazy view would keep the full history or batch buffer alive.
+        mx.async_eval(context)
         self._kept[request_id] = _KeptContext(
             tokens=list(tokens[:end]),
-            context=context[:, -self.ring_slots :],
+            context=context,
             end=end,
         )
         while len(self._kept) > _KEPT_REQUESTS:
@@ -627,6 +631,14 @@ class DFlashDrafter:
         anchors = mx.concatenate([anchor for _, _, _, anchor, _ in rows]).astype(
             mx.int32
         )
+        # DSpark's anchor row proposes the first token, so its block holds the
+        # anchor plus block - 2 masks and keeps every row.
+        markov = getattr(model, "markov_head", None)
+        anchor_slot = markov is not None and bool(
+            getattr(model.config, "sample_from_anchor", False)
+        )
+        if anchor_slot:
+            block -= 1
         masks = mx.full(
             (batch, block - 1), int(model.config.mask_token_id), dtype=mx.int32
         )
@@ -762,11 +774,13 @@ class DFlashDrafter:
                 row.fed = b + n
                 self._remember(row, h_ctx[index : index + 1, :n])
 
-        draft_hidden = model.norm(h)[:, 1:]
+        draft_hidden = model.norm(h) if anchor_slot else model.norm(h)[:, 1:]
         logits = model._logits(draft_hidden)
         samplers = [sampler for *_, sampler in rows]
         selector = getattr(model, "candidate_selector", None)
-        if selector is not None and selection.fused_select_eligible(
+        if markov is not None:
+            proposals = selection.select_markov(markov, logits, anchors, samplers)
+        elif selector is not None and selection.fused_select_eligible(
             selector, draft_hidden
         ):
             proposals = selection.select_fused(

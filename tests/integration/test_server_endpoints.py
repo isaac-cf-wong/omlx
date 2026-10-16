@@ -1997,6 +1997,12 @@ class TestSystemOneEndpoint:
         },
     }
 
+    @pytest.fixture(autouse=True)
+    def _decision_entry(self, mock_engine_pool):
+        mock_engine_pool._entries["test-clef-model"] = SimpleNamespace(
+            engine_type="decision"
+        )
+
     def test_systemone_response_shape(self, client, mock_decision_engine):
         video = "data:video/mp4;base64,AAAA"
         response = client.post(
@@ -2056,12 +2062,17 @@ class TestSystemOneEndpoint:
         assert str(error) in response.text
         assert mock_engine_pool.release_calls == ["test-clef-model"]
 
-    def test_systemone_rejects_non_decision_model(self, client):
+    def test_systemone_with_chat_model(self, client, mock_llm_engine, mock_engine_pool):
+        TestDecisionsEndpoint._letter_chat(mock_llm_engine)
         response = client.post(
             "/v1/systemone", json={**self._BODY, "model": "test-model"}
         )
-        assert response.status_code == 400
-        assert "not a decision model" in response.text
+
+        assert response.status_code == 200
+        answers = response.json()["answers"]
+        assert answers["urgent"] == {"type": "noul", "noul": 0.7311}
+        assert answers["team"]["probabilities"] == {"billing": 0.7311, "tech": 0.2689}
+        assert mock_engine_pool.release_calls == ["test-model"]
 
     @pytest.mark.parametrize(
         "change",

@@ -181,7 +181,7 @@ def test_fp32_kernels_match_mlx_mat_vecs(bits):
     gate_row = quantized((1, hidden), 64, 8)
     fmt = routed._Format
     gate_up_kernel = routed._gate_up_kernel(
-        fmt(bits, gs, True), fmt(8, 128, True), fmt(8, 64, False)
+        fmt(bits, gs, True), fmt(8, 128, True), fmt(8, 64, True)
     )
     down_kernel = routed._down_kernel(fmt(bits, gs, False), fmt(8, 128, False))
     for step in range(3):
