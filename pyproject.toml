@@ -253,6 +253,8 @@ include = ["omlx*"]
 "omlx.custom_kernels.minimax_m3" = ["*.metallib", "*.so"]
 "omlx.custom_kernels.qwen35_prefill" = ["*.metallib", "*.so"]
 "omlx.custom_kernels.bonsai" = ["*.metallib", "*.so"]
+# JIT-compiled at runtime from these headers.
+"omlx.custom_kernels.iq2_xxs" = ["csrc/*.h"]
 
 [tool.uv]
 # mlx and mlx-lm are git-pinned; override transitive pins
