@@ -2,6 +2,15 @@
 
 Server tests live in `tests/` and must not depend on `apps/`: after the full run, CI deletes `apps/`, collects the server tests again, and starts `omlx serve` to check the API-only fallback. Web UI tests live in `apps/omlx-web/tests/` and the macOS app's Python tests in `apps/omlx-mac/Tests/python/`. A plain `pytest` runs all three through `testpaths`. The standalone dashboard script tests are the `apps/omlx-web/tests/*.test.cjs` files except `network_auth_ui.test.cjs`, which `test_admin_network_auth_ui.py` runs with its input.
 
+# Qwen3.5 text-only checkpoint tests
+
+Run `python -m pytest -q tests/test_oq.py -k Qwen35TextCheckpoint` to check
+loading, oQe calibration, and sensitivity proxies for text-only Qwen3.5
+checkpoints. Small local dense and MoE models, with and without an MTP head,
+cover the Hugging Face `_text` names and the existing mlx-lm name, including
+strict loading of quantized output.
+No model download is required.
+
 # Qwen3-ASR audio quantization tests
 
 Run `python -m pytest -q tests/test_audio_stt.py -k Qwen3ASRAudioQuantization` to check Qwen3-ASR audio quantization through the STT loader. Small local checkpoints cover mixed 4-bit text and 8-bit audio weights and floating-point audio layers. No model download is required.
@@ -64,6 +73,10 @@ Run `python -m pytest -q tests/test_cli.py tests/test_integrations.py` to check 
 
 Run `python -m pytest -q tests/test_modernbert_attention.py tests/test_embedding.py tests/test_mlx_embeddings_compat.py` to check finite padded attention, single-input equivalence, local-window masking, and embedding integration. The attention regression covers fp16, bf16, and fp32 at lengths around the affected SDPA tile boundaries.
 
+# GGUF model tests
+
+Run `python -m pytest -q tests/test_model_discovery.py tests/test_splash_engine.py tests/test_hf_downloader.py -k "gguf or Gguf or nvfp4 or FileSelection or splash_package"` for GGUF models, Splash's checkpoint checks and file-selection downloads. The `write_gguf` fixture in `tests/conftest.py` writes a GGUF header with given metadata, so discovery, the generated model folder and its derived tokenizer, Splash's checks, and per-file deletion run without a model download.
+
 # Decision model tests
 
 Run `python -m pytest -q tests/test_systemone.py` to check the `/v1/systemone` decision models. Clef cases cover the prompt layout and question/option spans, state truncation, answer formatting, the joint head parameter names against the released checkpoint layout, and one logit per option for each question. OpenJev cases cover the text and screenshot prompt layouts, image sources, the two-stage readout for more than 52 options, and the calibration and confidence formulas. Decision 3.0 (d3) cases cover the release prompt text, question validation, answer formatting and confidence, 3D RoPE positions for image and video prompts, video frame sampling and timestamps, and media placeholder expansion. A tiny random Qwen3.5 backbone checks that chunked prefill matches a single pass, that a copied prefix cache gives the same readout as a full prefill, and that the d3 layer-step encode matches the model's own forward without a causal mask. Base-model checkpoints are covered too: a non-periodic `layer_types` schedule, a missing LM head, and `language_model.*` / `visual.*` weight names that sanitize once. Detection, pool dispatch, the endpoint and the oQ head and readout passthrough are tested in `test_model_discovery.py`, `test_engine_pool.py`, `integration/test_server_endpoints.py` and `test_oq.py`. No model download is required.
@@ -94,6 +107,10 @@ Run `python -m pytest -q tests/test_prefill_transient_tracker.py tests/test_pref
 
 Run `python -m pytest -q tests/test_scheduler.py tests/test_scheduler_boundary_completion.py tests/test_prefix_cache_gdn_split.py` to check cache-freshness admission and completed boundary recovery. The completion tests use a small initialized Qwen3.5 hybrid model and the real BatchGenerator, then compare restored-prefix logits with a fresh forward pass. They cover embedded snapshots, GDN sidecars, exact SpecPrefill static-prefix sidecars, off-boundary completion, and unknown or inconsistent cache positions.
 
+# Prefix cache serving statistics
+
+Run `python -m pytest -q tests/test_prefix_cache_restore_stats.py tests/test_cache_observability.py tests/test_runtime_cache_observability.py` to check serving cache hit rates and saved-token counters. Serving lookups count only KV retained after reconstruction, prefix/kickoff guards, scheduling validation and sparse-prefill fallback. A stale index match with no restored KV is a miss; a partial restore counts only its reusable tokens. Deferred admissions count once, and memory requeues do not count the same external request again. These tests use real paged metadata, hot-cache tensor storage and KV/ArraysCache reconstruction with small arrays, without a model download.
+
 # Batch KV capacity tests
 
 Run `python -m pytest -q tests/test_vlm_batch_kv_capacity.py` after changing `omlx/patches/vlm_batch_kv_capacity.py` or bumping the mlx-lm or mlx-vlm pin. The tests load the installed, unpatched cache module next to the patched one and compare cache state and attention output bit for bit through random appends, trims, rollbacks, merges, joins, filters and restores. They cover the mlx-vlm class, the mlx-lm class that prefix restore builds, and a batch that mixes both.
@@ -112,7 +129,9 @@ Replay is approximate; cache restoration is compared with the same chunk boundar
 
 Run `python -m pytest -q tests/test_deepseek_v41.py` for the text/vision port. Synthetic weights and small recorded official outputs cover prefill/decode, DSpark, Engram and vision numerics without a checkpoint download or vendored reference implementation. See `tests/fixtures/deepseek_v41_expected.md` for provenance and reference corrections. PyTorch is optional for the independent FP8/FP4 arithmetic checks. Other cases cover BatchGenerator admission, cache restoration, DSML and VLM engine execution.
 
-FP8 activation boundary and layout checks: `python -m pytest tests/test_deepseek_v41_activation.py -q`. These compare fused FP8 and weighted SwiGLU kernels against reference arithmetic across rounding ties, scale transitions, clipping, intermediate casts and floating-point dtypes.
+FP8 activation boundary and layout checks: `python -m pytest tests/test_deepseek_v41_activation.py -q`. These compare fused FP8 and weighted SwiGLU kernels against reference arithmetic across rounding ties, scale transitions, clipping, intermediate casts and floating-point dtypes, and the one-pass RoPE kernel (with its fused act_quant and heads-major input) against the reference rotation.
+
+Fused decode kernels: `python -m pytest tests/test_deepseek_v41_fused_decode.py -q`. A five-layer random model with MXFP or oQ2-oQ3 affine layouts (2-8 bits) runs each decode layer against the unfused block, batched and MTP verify blocks are checked bitwise against single-token decode (including the matrix-tile kernels an MTP-enabled model uses), and DSpark generation must reproduce greedy decoding.
 
 MoE activation reuse and per-expert reference checks: `python -m pytest tests/test_deepseek_v41_moe.py -q`. These cover sorted prefill, decode, independent routed/shared activation policies, and repeated outputs with small quantized weights.
 

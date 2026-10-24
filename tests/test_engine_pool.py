@@ -32,6 +32,7 @@ from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
     Qwen4ExpResidencyEstimate,
 )
 from omlx.scheduler import PrefillEvictionRequest, SchedulerConfig
+from tests.test_cluster_engine_pool import _deployment
 
 
 def _make_pool(ceiling: int | None = None, **kwargs) -> EnginePool:
@@ -1178,6 +1179,33 @@ class TestVLMFallback:
         assert entry.engine is mock_batched_engine
 
     @pytest.mark.asyncio
+    async def test_cluster_deployment_runs_a_vlm_checkpoint_distributed(
+        self, small_mock_model_dir
+    ):
+        """A coordinator holding a VLM checkpoint serves it through its ranks."""
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        entry.model_type = entry.engine_type = "vlm"
+        deployment = _deployment(entry.model_path)
+        pool._cluster_registry = SimpleNamespace(get_for_model=lambda _: deployment)
+        distributed = MagicMock()
+        distributed.start = AsyncMock()
+
+        with (
+            patch(
+                "omlx.engine.distributed.DistributedBatchedEngine",
+                return_value=distributed,
+            ) as cls,
+            patch("omlx.engine_pool.VLMBatchedEngine") as local,
+        ):
+            await pool._load_engine("model-a")
+
+        assert entry.engine is distributed
+        assert cls.call_args.kwargs["vision_checkpoint"] is True
+        local.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_non_vlm_failure_still_raises(self, small_mock_model_dir):
         """Test that non-VLM engine failures propagate normally."""
         pool = _make_pool(ceiling=10 * 1024**3)
@@ -1729,6 +1757,55 @@ class TestEnginePoolAsync:
         assert entry.runtime_settings_signature == pool._engine_runtime_signature(
             "model-a", ModelSettings(dflash_enabled=True)
         )
+
+    @pytest.mark.asyncio
+    async def test_minimax_bundled_dspark_is_charged_and_takes_the_mtp_depth(
+        self, pool_with_mock_engines, small_mock_model_dir
+    ):
+        pool = pool_with_mock_engines
+        pool._scheduler_config.max_num_seqs = 8
+        entry = pool.get_entry("model-a")
+        entry.config_model_type = "minimax_m3_vl"
+        draft_path = small_mock_model_dir / "model-a" / "dspark"
+        draft_path.mkdir()
+        text_config = {
+            "hidden_size": 64,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "num_hidden_layers": 2,
+            "sliding_window": 32,
+            "dflash_config": {"target_layer_ids": [1, 3]},
+        }
+        (draft_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["DSparkMiniMaxDraftModel"],
+                    "text_config": text_config,
+                }
+            )
+        )
+        (draft_path / "model-dspark-00001.safetensors").write_bytes(b"0" * 1000)
+        settings = ModelSettings(mtp_enabled=True, mtp_adaptive_max_depth=3)
+        # Per window token: two layers' K/V, the projected row and two captures.
+        row_bytes = 32 * 2 * (2 * 2 * 2 * 16 + 64 + 2 * 64)
+        assert pool._entry_runtime_resident_size(
+            entry, settings
+        ) - pool._entry_runtime_resident_size(entry, ModelSettings()) == (
+            1000 + 8 * row_bytes
+        )
+
+        engine = MagicMock()
+        engine.start = AsyncMock()
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=engine),
+            patch("omlx.engine_pool.load_minimax_dspark_drafter") as load,
+        ):
+            await pool.get_engine("model-a", runtime_settings=settings)
+
+        assert load.call_args.args[0] == draft_path
+        assert load.call_args.args[2:] == (3, False)
+        engine.set_dflash_drafter.assert_called_once_with(load.return_value)
 
     @pytest.mark.asyncio
     async def test_dflash_drafter_failure_reuses_requested_variant_while_leased(
@@ -3819,6 +3896,30 @@ class TestResolveModelId:
 
         result = pool.resolve_model_id("omlx/MODEL-B", settings_manager=None)
         assert result == "model-b"
+
+    def test_claude_tier_alias_never_shadows_models_or_aliases(
+        self, small_mock_model_dir
+    ):
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        settings_manager = MagicMock()
+        settings_manager.get_exposed_profile_source_model_id.return_value = None
+        settings_manager.get_all_settings.return_value = {
+            "model-a": ModelSettings(model_alias="claude-haiku"),
+        }
+        tiers = {
+            "claude-sonnet": "model-b",
+            "claude-haiku": "model-b",
+            "model-a": "model-b",
+        }
+
+        def resolve(name):
+            return pool.resolve_model_id(name, settings_manager, tiers)
+
+        assert resolve("claude-sonnet") == "model-b"
+        assert resolve("omlx/claude-sonnet") == "model-b"
+        assert resolve("claude-haiku") == "model-a"
+        assert resolve("model-a") == "model-a"
 
 class TestMemorySettleBarrier:
     """Tests for memory settle barrier in _unload_engine()."""

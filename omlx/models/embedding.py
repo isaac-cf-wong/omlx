@@ -22,9 +22,6 @@ from mlx.utils import tree_flatten, tree_map
 from mlx_vlm.embedding_loader import load_embedding_model
 from mlx_vlm.utils import load_audio, load_config, load_processor
 
-from ..patches.embedding_gemma2_image_layout import (
-    apply_embedding_gemma2_image_layout_patch,
-)
 from ..patches.modernbert_attention import patch_modernbert_attention
 from ..utils.image import _decode_input_audio_data, validate_image_data_uri
 from .base_model import (
@@ -439,9 +436,6 @@ class MLXEmbeddingModel:
             return False
 
         logger.info(f"Loading embedding model via mlx-vlm: {self.model_name}")
-        # Class-level patch; safe before the processor is instantiated and
-        # applies to instances loaded earlier in this process too.
-        apply_embedding_gemma2_image_layout_patch()
         config = load_config(model_path)
         # The audio tower is resident even for text-only requests, so it loads
         # only when the model's embedding_audio_enabled setting asks for it.
@@ -1023,7 +1017,7 @@ class MLXEmbeddingModel:
             row for _, row in sorted(zip(positions, rows), key=lambda pair: pair[0])
         ]
         if total_tokens is None:
-            total_tokens = self._count_tokens(normalized_inputs)
+            total_tokens = self._count_tokens(normalized_inputs, max_length, truncation)
         dimensions = len(embeddings[0]) if embeddings else 0
 
         return EmbeddingOutput(
@@ -1156,9 +1150,12 @@ class MLXEmbeddingModel:
         return embeddings_array, total_tokens
 
     def _count_tokens(
-        self, inputs: Union[List[str], List[Dict[str, str]]]
+        self,
+        inputs: Union[List[str], List[Dict[str, str]]],
+        max_length: int,
+        truncation: bool,
     ) -> int:
-        """Count total tokens in input texts."""
+        """Count the input text tokens the model ran on."""
         total = 0
         processor = self.processor
 
@@ -1169,21 +1166,22 @@ class MLXEmbeddingModel:
             if hasattr(processor, "encode"):
                 tokens = processor.encode(text, add_special_tokens=True)
                 if isinstance(tokens, list):
-                    total += len(tokens)
+                    count = len(tokens)
                 elif hasattr(tokens, "shape"):
-                    total += tokens.shape[-1] if tokens.ndim > 0 else 1
+                    count = tokens.shape[-1] if tokens.ndim > 0 else 1
                 elif hasattr(tokens, "ids"):
-                    total += len(tokens.ids)
+                    count = len(tokens.ids)
                 else:
-                    total += len(tokens)
+                    count = len(tokens)
             elif hasattr(processor, "tokenizer"):
                 tokens = processor.tokenizer.encode(text, add_special_tokens=True)
-                total += len(tokens) if isinstance(tokens, list) else len(list(tokens))
+                count = len(tokens) if isinstance(tokens, list) else len(list(tokens))
             elif hasattr(processor, "_tokenizer"):
                 tokens = processor._tokenizer.encode(text, add_special_tokens=True)
-                total += len(tokens) if isinstance(tokens, list) else len(list(tokens))
+                count = len(tokens) if isinstance(tokens, list) else len(list(tokens))
             else:
-                total += len(text.split()) + 2
+                count = len(text.split()) + 2
+            total += min(count, max_length) if truncation else count
 
         return total
 

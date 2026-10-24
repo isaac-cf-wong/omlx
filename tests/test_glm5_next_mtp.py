@@ -591,6 +591,8 @@ def _record_runtime_applies(monkeypatch):
         ("glm5_next", ["glm5_next_vlm_runtime"]),
         ("qwen3_5", ["qwen35_vlm_runtime"]),
         ("qwen3_5_moe", ["qwen35_moe_vlm_runtime", "qwen35_vlm_runtime"]),
+        # MiniCPM-V 4.7 wraps a Qwen3.5 MoE (or dense Qwen3.5) language model.
+        ("minicpmv4_7", ["qwen35_moe_vlm_runtime", "qwen35_vlm_runtime"]),
         # qwen4_exp runs its own MTP and subclasses the qwen3_5 classes these
         # patches rebind, so the sweep must not reach it.
         ("qwen4_exp", []),
@@ -1454,7 +1456,7 @@ _CYCLES = [
 
 def _native_indexer_available() -> bool:
     try:
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.sparse_index import fast
 
         return bool(
             fast.has_symbol("dsa_indexer_scores")

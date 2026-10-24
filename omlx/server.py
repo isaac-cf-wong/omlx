@@ -51,6 +51,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Union
@@ -88,6 +89,7 @@ from .api.anthropic_utils import (
     create_message_stop_event,
     create_text_delta_event,
     create_thinking_delta_event,
+    is_auto_mode_classifier_request,
     map_finish_reason_to_stop_reason,
     request_has_cache_control,
 )
@@ -125,6 +127,7 @@ from .api.openai_models import (
     ChatCompletionChunkDelta,
     ChatCompletionRequest,
     ChatCompletionResponse,
+    ClaudeTierModelInfo,
     CompletionChoice,
     CompletionRequest,
     CompletionResponse,
@@ -180,7 +183,12 @@ from .api.decisions import (
 )
 from .api.decisions_models import DecisionRequest
 from .api.systemone_models import SystemOneRequest
-from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
+from .api.thinking import (
+    ThinkingParser,
+    extract_thinking,
+    leading_thinking_only,
+    prompt_opens_thinking,
+)
 from .api.tool_calling import (
     ToolCallExtraction,
     ToolCallStreamSegment,
@@ -212,7 +220,11 @@ from .engine.vlm import MINIMAX_M3_MODEL_TYPES
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine.decision import DecisionEngine
-from .engine_pool import EnginePool
+from .engine_pool import (
+    CLAUDE_DESKTOP_TIER_FAMILY,
+    EnginePool,
+    build_claude_tier_aliases,
+)
 from .exceptions import (
     EnginePoolError,
     InsufficientMemoryError,
@@ -231,6 +243,7 @@ from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
 from .models.decision import DecisionContextLengthError, DecisionRequestError
 from .prefill_progress import get_prefill_tracker
 from .server_metrics import get_server_metrics, reset_server_metrics
+from .utils.network import is_loopback_bind
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -358,7 +371,7 @@ async def verify_api_key(
     Checks the provided Bearer token against the main API key and all sub keys.
     Also accepts the x-api-key header as a fallback (Anthropic SDK compatibility).
     """
-    from .admin.auth import fingerprint_key, verify_any_api_key
+    from .admin.auth import check_api_key, fingerprint_key, verify_any_api_key
     from .utils.network import is_loopback_bind
 
     global_settings = _server_state.global_settings
@@ -400,7 +413,10 @@ async def verify_api_key(
         if global_settings is not None
         else []
     )
-    if not verify_any_api_key(api_key_value, _server_state.api_key, sub_keys):
+    if not check_api_key(
+        request,
+        lambda: verify_any_api_key(api_key_value, _server_state.api_key, sub_keys),
+    ):
         logger.warning("Rejected API key (fp=%s)", fingerprint_key(api_key_value))
         raise HTTPException(status_code=401, detail="Invalid API key")
 
@@ -582,6 +598,10 @@ async def lifespan(app: FastAPI):
                     )
                 ),
             )
+            bind_host = _server_state.bind_host
+            discovery_service.config.caps.loopback_only = isinstance(
+                bind_host, str
+            ) and is_loopback_bind(bind_host)
             configure_discovery_service(discovery_service)
             await asyncio.to_thread(discovery_service.start)
         except Exception as exc:  # pragma: no cover - defensive
@@ -845,7 +865,7 @@ def _register_cluster_routes() -> None:
     from .cluster.routes import router as cluster_router
     from .cluster.routes import set_cluster_getters
 
-    set_cluster_getters(get_engine_pool)
+    set_cluster_getters(get_engine_pool, lambda: _server_state.settings_manager)
     app.include_router(
         cluster_router,
         dependencies=[
@@ -980,7 +1000,9 @@ async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
         )
     else:
         content = {"detail": exc.detail}
-    return JSONResponse(status_code=exc.status_code, content=content)
+    return JSONResponse(
+        status_code=exc.status_code, content=content, headers=exc.headers
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -1462,9 +1484,11 @@ async def get_engine(
         if runtime is not None:
             model_id, runtime_settings = runtime
         else:
-            model_id = pool.resolve_model_id(model_id, sm)
+            model_id = _pool_resolve_model_id(
+                pool, model_id, sm, get_claude_tier_aliases()
+            )
     else:
-        model_id = pool.resolve_model_id(model_id, sm)
+        model_id = _pool_resolve_model_id(pool, model_id, sm, get_claude_tier_aliases())
     _wake_process_memory_enforcer(active=True)
 
     # Only thread optional kwargs through when they are needed, so the common
@@ -2028,6 +2052,32 @@ def get_model_settings_for_request(model_id: str | None):
     )
 
 
+def get_claude_tier_aliases() -> dict[str, str]:
+    """Return derived Claude Desktop tier aliases from global settings.
+
+    Each entry maps a public slot ID (``claude-opus`` /
+    ``claude-sonnet`` / ``claude-haiku``) to the model
+    configured in the matching Claude Code tier. Returns an empty dict
+    when Claude Desktop exposure is disabled (the default) or no tier is
+    configured.
+    """
+    gs = _server_state.global_settings
+    if gs is None:
+        return {}
+    return build_claude_tier_aliases(getattr(gs, "claude_code", None))
+
+
+def _pool_resolve_model_id(
+    pool, model_id: str, settings_manager, tier_aliases=None
+) -> str:
+    """Resolve via the pool, threading Claude tier aliases when present."""
+    if not tier_aliases:
+        return pool.resolve_model_id(model_id, settings_manager)
+    return pool.resolve_model_id(
+        model_id, settings_manager, claude_tier_aliases=tier_aliases
+    )
+
+
 def resolve_model_id(model_id: str | None) -> str | None:
     """Resolve a model alias to its real model ID.
 
@@ -2038,7 +2088,9 @@ def resolve_model_id(model_id: str | None) -> str | None:
     pool = _server_state.engine_pool
     if pool is None:
         return model_id
-    return pool.resolve_model_id(model_id, _server_state.settings_manager)
+    return _pool_resolve_model_id(
+        pool, model_id, _server_state.settings_manager, get_claude_tier_aliases()
+    )
 
 
 async def _ensure_tokenizer_for_system_probe(
@@ -2639,13 +2691,19 @@ _KEEPALIVE_COMPLETION_CHUNK = (
 )
 
 
-def _completion_keepalive_chunk(response_id: str) -> str:
-    """Keepalive frame that shares the stream's completion id."""
+def _completion_keepalive_chunk(response_id: str, model: str) -> str:
+    """Keepalive with the stream's id/model and a current creation timestamp.
+
+    See ``_chat_keepalive_chunk`` for why each identity field must match.
+    """
     return (
-        'data: {"id":"' + response_id + '","object":"text_completion","created":0,'
-        '"model":"keepalive",'
+        'data: {"id":"' + response_id + '","object":"text_completion",'
+        '"created":' + str(int(time.time())) + ","
+        '"model":' + json.dumps(model) + ","
         '"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null}]}\n\n'
     )
+
+
 _KEEPALIVE_ANTHROPIC_PING = 'event: ping\ndata: {"type":"ping"}\n\n'
 
 
@@ -2707,8 +2765,8 @@ def _resolve_keepalive(
     return None
 
 
-def _chat_keepalive_chunk(response_id: str) -> str:
-    """Keepalive frame that shares the stream's completion id.
+def _chat_keepalive_chunk(response_id: str, model: str) -> str:
+    """Keepalive with the stream's id/model and a current creation timestamp.
 
     The static ``_KEEPALIVE_CHAT_CHUNK`` carries a sentinel id
     (``chatcmpl-keepalive``) that differs from the real completion chunks.
@@ -2720,13 +2778,20 @@ def _chat_keepalive_chunk(response_id: str) -> str:
     those clients while remaining a parseable data event for clients that can't
     handle SSE comment lines.
 
+    Callers pass ``request.model`` because every real chunk carries it: clients
+    that latch the stream's model and ``created`` from the first chunk would
+    otherwise report the sentinel ``"keepalive"`` model and epoch 0. The frame
+    is built when the stream is set up, so ``created`` is stamped then, just as
+    each real chunk stamps its own creation time.
+
     The delta must also carry ``"role":"assistant"`` — see the comment on
     ``_KEEPALIVE_CHAT_CHUNK`` (accumulators that type the stream from the
     first chunk's role drop tool_call_chunks without it, #2074).
     """
     return (
         'data: {"id":"' + response_id + '","object":"chat.completion.chunk",'
-        '"created":0,"model":"keepalive",'
+        '"created":' + str(int(time.time())) + ","
+        '"model":' + json.dumps(model) + ","
         '"choices":[{"index":0,"delta":{"role":"assistant","content":""},'
         '"finish_reason":null}]}\n\n'
     )
@@ -2831,29 +2896,26 @@ async def _with_prompt_progress(
         await _aclose_async_iterator(outputs)
 
 
-def _request_abort_id(engine: BaseEngine) -> str | None:
-    """Mint an opaque id only for engines with targeted abort semantics."""
-
-    if not getattr(engine, "supports_request_scoped_abort", False):
-        return None
-    abort = getattr(engine, "abort_request", None)
-    if not callable(abort):
-        return None
-    return f"transport-{uuid.uuid4().hex}"
+# Carries the engine request id, the id /admin/api/stats lists.
+_REQUEST_ID_HEADER = "X-oMLX-Request-ID"
 
 
 async def _with_request_disconnect_abort(
     generator: AsyncIterator[str],
     http_request: FastAPIRequest,
     engine: BaseEngine,
-    request_id: str | None,
+    request_id: str,
 ) -> AsyncIterator[str]:
     """Bind one public response transport to one inference request."""
 
     signal = http_request.scope.get(_DISCONNECT_SIGNAL_SCOPE_KEY)
+    abort = getattr(engine, "abort_request", None)
     token: int | None = None
-    if request_id is not None and isinstance(signal, _ClientDisconnectSignal):
-        abort = getattr(engine, "abort_request")
+    if (
+        getattr(engine, "supports_request_scoped_abort", False)
+        and callable(abort)
+        and isinstance(signal, _ClientDisconnectSignal)
+    ):
 
         async def abort_disconnected_request() -> None:
             await abort(
@@ -3548,7 +3610,7 @@ async def _create_markitdown_chat_completion(
         response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
         keepalive = _resolve_keepalive("openai_chat")
         if keepalive == _KEEPALIVE_CHAT_CHUNK:
-            keepalive = _chat_keepalive_chunk(response_id)
+            keepalive = _chat_keepalive_chunk(response_id, request.model)
         markdown_chunks = stream_messages_to_markdown_async(
             request.messages,
             global_settings=_server_state.global_settings,
@@ -3603,8 +3665,8 @@ async def _create_markitdown_chat_completion(
     )
 
 
-@app.get("/v1/models")
-async def list_models(_: bool = Depends(verify_inference_api_key)) -> ModelsResponse:
+@app.get("/v1/models", response_model=None)
+async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONResponse:
     """List all available models with load status."""
     models = []
     favorite_ids: set[str] = set()
@@ -3651,7 +3713,11 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> ModelsResp
                 or m.get("model_path") in referenced_drafts
                 or (m.get("source_repo_id") in referenced_drafts)
             )
-            if is_hidden or is_hidden_helper:
+            # A GGUF no external engine can serve is listed in the admin only.
+            unservable = m.get("model_format") == "gguf" and bool(
+                await _server_state.engine_pool.external_engine_problem(model_id, ms)
+            )
+            if is_hidden or is_hidden_helper or unservable:
                 excluded_model_ids.add(model_id)
                 continue
             if ms is not None and ms.is_favorite:
@@ -3663,9 +3729,12 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> ModelsResp
                     max_model_len=get_max_context_window(model_id),
                 )
             )
+        # Both sets are needed by the exposed-profile and Claude tier-alias
+        # blocks below, and the latter runs with or without a settings manager,
+        # so they are built here rather than inside the settings guard.
+        physical_ids = {m["id"] for m in status["models"]}
+        existing_ids = {m.id for m in models}
         if settings_manager:
-            physical_ids = {m["id"] for m in status["models"]}
-            existing_ids = {m.id for m in models}
             for profile in settings_manager.list_exposed_profile_models():
                 source_model_id = profile["source_model_id"]
                 profile_model_id = profile["model_id"]
@@ -3684,6 +3753,59 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> ModelsResp
                 )
                 existing_ids.add(profile_model_id)
 
+        # Claude Desktop tier aliases: derived, non-persisted slot IDs
+        # that resolve at runtime to the configured Claude Code tier models.
+        # Skipped (with a warning, never a crash) when the slot collides with
+        # an existing model ID or an exposed custom alias, and when the tier
+        # names a model that is not discovered: resolution hands the raw tier
+        # value to pool.get_engine, which only accepts physical model IDs, so
+        # a stale or aliased tier would list a slot no request can serve.
+        tier_aliases = get_claude_tier_aliases()
+        if tier_aliases:
+            custom_aliases = set()
+            if settings_manager:
+                for _ms in settings_manager.get_all_settings().values():
+                    if _ms.model_alias:
+                        custom_aliases.add(_ms.model_alias)
+            created_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+            for slot_id, tier_model in tier_aliases.items():
+                if (
+                    slot_id in existing_ids
+                    or slot_id in physical_ids
+                    or slot_id in custom_aliases
+                ):
+                    logger.warning(
+                        "Skipping Claude Desktop tier alias %r: collides with "
+                        "an existing model ID or custom alias",
+                        slot_id,
+                    )
+                    continue
+                if tier_model not in physical_ids:
+                    logger.warning(
+                        "Skipping Claude Desktop tier alias %r: tier model %r "
+                        "is not an available model",
+                        slot_id,
+                        tier_model,
+                    )
+                    continue
+                max_tokens = _server_state.sampling.max_tokens
+                tier_ms = get_model_settings_for_request(tier_model)
+                if tier_ms is not None and tier_ms.max_tokens is not None:
+                    max_tokens = tier_ms.max_tokens
+                models.append(
+                    ClaudeTierModelInfo(
+                        id=slot_id,
+                        owned_by="omlx",
+                        max_model_len=get_max_context_window(tier_model),
+                        display_name=tier_model,
+                        created_at=created_at,
+                        anthropic_family_tier=CLAUDE_DESKTOP_TIER_FAMILY.get(slot_id),
+                        is_family_default=True,
+                        max_tokens=max_tokens,
+                    )
+                )
+                existing_ids.add(slot_id)
+
     if _markitdown_is_visible() and not any(
         m.id == MARKITDOWN_MODEL_ID for m in models
     ):
@@ -3693,7 +3815,18 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> ModelsResp
     if favorite_ids:
         models.sort(key=lambda m: m.id not in favorite_ids)
 
-    return ModelsResponse(data=models)
+    # Serialize explicitly: FastAPI's jsonable_encoder and the
+    # ``ModelsResponse`` container both serialize items as the base
+    # ``ModelInfo`` (dropping the tier metadata), while a route-level
+    # exclude would drop upstream fields like ``max_model_len: null``.
+    # Per-item ``model_dump()`` honors each instance's own field config:
+    # standard entries stay byte-identical, tier aliases carry metadata.
+    return JSONResponse(
+        content={
+            "object": "list",
+            "data": [m.model_dump() for m in models],
+        }
+    )
 
 
 @app.get("/v1/models/status")
@@ -4376,13 +4509,13 @@ async def create_completion(
         for prompt in prompts:
             await engine.preflight_completion(prompt, request_id=upstream_request_id)
         await _raise_if_llm_lease_abort_requested(lease)
-        inference_request_id = _request_abort_id(engine)
+        inference_request_id = str(uuid.uuid4())
 
         if request.stream:
             response_id = f"cmpl-{uuid.uuid4().hex[:8]}"
             keepalive = _resolve_keepalive("openai_completion")
             if keepalive == _KEEPALIVE_COMPLETION_CHUNK:
-                keepalive = _completion_keepalive_chunk(response_id)
+                keepalive = _completion_keepalive_chunk(response_id, request.model)
             return StreamingResponse(
                 _release_after_stream(
                     _with_request_disconnect_abort(
@@ -4407,7 +4540,11 @@ async def create_completion(
                     lease,
                 ),
                 media_type="text/event-stream",
-                headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+                headers={
+                    "X-Accel-Buffering": "no",
+                    "Cache-Control": "no-cache",
+                    _REQUEST_ID_HEADER: inference_request_id,
+                },
             )
 
         # Non-streaming response with keepalive during prefill
@@ -4448,7 +4585,8 @@ async def create_completion(
             thinking_budget = _resolve_thinking_budget(request, request.model)
             if thinking_budget is not None:
                 gen_kwargs["thinking_budget"] = thinking_budget
-            if inference_request_id is not None:
+            # A list prompt runs one engine request per prompt, so no single id.
+            if len(prompts) == 1:
                 gen_kwargs["_request_id"] = inference_request_id
             # Widen the repetition-penalty look-back window when the client
             # asks for it (mlx-lm default window is 20 tokens).
@@ -4551,7 +4689,14 @@ async def create_completion(
             ).model_dump_json(exclude_none=True)
 
         return await _json_response_or_keepalive(
-            http_request, _build_completion(), lease=lease
+            http_request,
+            _build_completion(),
+            lease=lease,
+            headers=(
+                {_REQUEST_ID_HEADER: inference_request_id}
+                if len(prompts) == 1
+                else None
+            ),
         )
     except BaseException:
         await lease.release()
@@ -4839,6 +4984,7 @@ async def create_chat_completion(
             structured_outputs is not None or response_format
         ):
             await engine.start()
+            reasoning_parser = _grammar_reasoning_parser(engine, reasoning_parser)
         compiled_grammar = (
             None
             if native_response_format is not None
@@ -5013,9 +5159,8 @@ async def create_chat_completion(
         )
 
         await _raise_if_llm_lease_abort_requested(lease)
-        inference_request_id = _request_abort_id(engine)
-        if inference_request_id is not None:
-            chat_kwargs["_request_id"] = inference_request_id
+        inference_request_id = str(uuid.uuid4())
+        chat_kwargs["_request_id"] = inference_request_id
 
         if request.stream:
             # Pre-mint the completion id so the keepalive frame (emitted before the
@@ -5023,8 +5168,12 @@ async def create_chat_completion(
             response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
             keepalive = _resolve_keepalive("openai_chat")
             if keepalive == _KEEPALIVE_CHAT_CHUNK:
-                keepalive = _chat_keepalive_chunk(response_id)
-            sse_headers = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
+                keepalive = _chat_keepalive_chunk(response_id, request.model)
+            sse_headers = {
+                "X-Accel-Buffering": "no",
+                "Cache-Control": "no-cache",
+                _REQUEST_ID_HEADER: inference_request_id,
+            }
             if response_format_warning:
                 sse_headers["Warning"] = response_format_warning
             return StreamingResponse(
@@ -5106,6 +5255,7 @@ async def create_chat_completion(
             raw_text = clean_special_tokens(output.text) if output.text else ""
             thinking_content, regular_content = extract_thinking(
                 raw_text,
+                leading_only=_leading_thinking_only(engine),
                 truncated=output.finish_reason == "length",
                 start_in_thinking=(
                     output.finish_reason == "length"
@@ -5210,9 +5360,9 @@ async def create_chat_completion(
                 ),
             ).model_dump_json(exclude_none=True)
 
-        json_headers = (
-            {"Warning": response_format_warning} if response_format_warning else None
-        )
+        json_headers = {_REQUEST_ID_HEADER: inference_request_id}
+        if response_format_warning:
+            json_headers["Warning"] = response_format_warning
         return await _json_response_or_keepalive(
             http_request, _build_chat_completion(), lease=lease, headers=json_headers
         )
@@ -5454,6 +5604,27 @@ def _allow_reasoning_opener(tag_dict: dict) -> None:
         content["excludes"] = [x for x in content["excludes"] if x != opener]
 
 
+def _end_harmony_final_on_stop(tag_dict: dict) -> None:
+    """Let the Harmony final message end with the model's stop token.
+
+    ``<|return|>`` is the gpt-oss EOS, so xgrammar accepts it only as a stop
+    token and never as tag end text. The builtin end list then leaves only
+    ``<|end|>``, after which the model opens another message.
+    """
+    for tag in tag_dict["format"]["tags"]:
+        if tag.get("begin") == "<|channel|>final<|message|>":
+            tag["end"] = ""
+
+
+def _grammar_reasoning_parser(engine, reasoning_parser: str | None) -> str | None:
+    """Return the structural tag parser for a grammar-constrained request."""
+    # gpt-oss output always goes through the Harmony parser, which needs the
+    # channel headers that a bare grammar would mask.
+    if reasoning_parser is None and engine.model_type == "gpt_oss":
+        return "harmony"
+    return reasoning_parser
+
+
 def _compile_with_structural_tag(
     compiler, fmt: dict, reasoning_parser: str, chat_template_kwargs: dict | None
 ):
@@ -5476,6 +5647,8 @@ def _compile_with_structural_tag(
     tag = xgr.get_builtin_structural_tag(reasoning_parser, reasoning=reasoning)
     tag_dict = tag.model_dump()
     _allow_reasoning_opener(tag_dict)
+    if reasoning_parser == "harmony":
+        _end_harmony_final_on_stop(tag_dict)
     # Compiling the tag without the user grammar would leave the answer
     # unconstrained, so fail and let the caller report it.
     if not _patch_output_format(tag_dict, fmt):
@@ -5994,6 +6167,10 @@ def _render_chat_prompt_for_thinking_detection(
     return str(prompt), None
 
 
+def _leading_thinking_only(engine: BaseEngine) -> bool:
+    return leading_thinking_only(getattr(engine, "tokenizer", None))
+
+
 def _chat_prompt_opens_thinking(
     engine: BaseEngine,
     messages: list,
@@ -6082,7 +6259,9 @@ def _nonstream_recovery_text(
     # Judge the text the stream filter would see, before special tokens are
     # cleaned out of it.
     _, generated = extract_thinking(
-        output.text or "", truncated=output.finish_reason == "length"
+        output.text or "",
+        truncated=output.finish_reason == "length",
+        leading_only=leading_thinking_only(tokenizer),
     )
     probe = ToolCallStreamFilter(tokenizer, tools=tools)
     probe.feed(generated)
@@ -6216,7 +6395,10 @@ async def stream_chat_completion(
             )
     except Exception as exc:
         logger.debug("Could not detect chat stream thinking state: %s", exc)
-    thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
+    leading_only = _leading_thinking_only(engine)
+    thinking_parser = ThinkingParser(
+        start_in_thinking=start_in_thinking, leading_only=leading_only
+    )
 
     def mark_visible_delta() -> None:
         nonlocal first_visible_time
@@ -6562,6 +6744,7 @@ async def stream_chat_completion(
         # (falls back to thinking content for small models)
         thinking_content, regular_content = extract_thinking(
             accumulated_text,
+            leading_only=leading_only,
             truncated=last_output is not None and last_output.finish_reason == "length",
         )
         extraction = extract_tool_calls_with_thinking(
@@ -6926,7 +7109,10 @@ async def stream_anthropic_messages(
             )
     except Exception as exc:
         logger.debug("Could not detect Anthropic stream thinking state: %s", exc)
-    thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
+    leading_only = _leading_thinking_only(engine)
+    thinking_parser = ThinkingParser(
+        start_in_thinking=start_in_thinking, leading_only=leading_only
+    )
     thinking_block_started = False
     text_block_started = False
     block_index = 0
@@ -7170,6 +7356,7 @@ async def stream_anthropic_messages(
         # (falls back to thinking content for small models)
         thinking_content, regular_content = extract_thinking(
             accumulated_text,
+            leading_only=leading_only,
             truncated=last_output is not None and last_output.finish_reason == "length",
         )
         extraction = extract_tool_calls_with_thinking(
@@ -7329,6 +7516,11 @@ async def stream_anthropic_messages(
 
     # 7. Send message_stop
     yield create_message_stop_event()
+
+
+# Fits the first classifier stage in Claude Code's 60 s deadline at about
+# 10 tok/s. Reasoning models that skip thinking often break the verdict format.
+_AUTO_MODE_CLASSIFIER_THINKING_BUDGET = 256
 
 
 @app.post("/v1/messages")
@@ -7524,6 +7716,11 @@ async def create_anthropic_message(
         ):
             merged_ct_kwargs["enable_thinking"] = True
 
+        if is_auto_mode_classifier_request(request):
+            # Claude Code sends no thinking field here for non-Claude model
+            # names. Bound reasoning to its deadline, but do not turn it on.
+            chat_kwargs["thinking_budget"] = _AUTO_MODE_CLASSIFIER_THINKING_BUDGET
+
         # Auto-set preserve_thinking only when the template advertises support
         # for it (Qwen 3.6+). Gated on detection so other templates don't
         # receive an unknown kwarg.
@@ -7627,9 +7824,8 @@ async def create_anthropic_message(
             **chat_kwargs,
         )
         await _raise_if_llm_lease_abort_requested(lease)
-        inference_request_id = _request_abort_id(engine)
-        if inference_request_id is not None:
-            chat_kwargs["_request_id"] = inference_request_id
+        inference_request_id = str(uuid.uuid4())
+        chat_kwargs["_request_id"] = inference_request_id
 
         if request.stream:
             return StreamingResponse(
@@ -7653,7 +7849,11 @@ async def create_anthropic_message(
                     lease,
                 ),
                 media_type="text/event-stream",
-                headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+                headers={
+                    "X-Accel-Buffering": "no",
+                    "Cache-Control": "no-cache",
+                    _REQUEST_ID_HEADER: inference_request_id,
+                },
             )
 
         # Non-streaming response with keepalive during prefill
@@ -7692,6 +7892,7 @@ async def create_anthropic_message(
             raw_text = clean_special_tokens(output.text) if output.text else ""
             thinking_content, regular_content = extract_thinking(
                 raw_text,
+                leading_only=_leading_thinking_only(engine),
                 truncated=output.finish_reason == "length",
                 start_in_thinking=(
                     output.finish_reason == "length"
@@ -7755,7 +7956,10 @@ async def create_anthropic_message(
             return response.model_dump_json()
 
         return await _json_response_or_keepalive(
-            http_request, _build_anthropic_message(), lease=lease
+            http_request,
+            _build_anthropic_message(),
+            lease=lease,
+            headers={_REQUEST_ID_HEADER: inference_request_id},
         )
 
     except BaseException:
@@ -8209,6 +8413,9 @@ async def create_response(
                 )
                 if native_response_format is None:
                     await engine.start()
+                    reasoning_parser = _grammar_reasoning_parser(
+                        engine, reasoning_parser
+                    )
                     rf = ResponseFormat(**response_format)
                     compiled_grammar = _compile_grammar_for_request(
                         engine,
@@ -8381,12 +8588,15 @@ async def create_response(
             **chat_kwargs,
         )
         await _raise_if_llm_lease_abort_requested(lease)
-        inference_request_id = _request_abort_id(engine)
-        if inference_request_id is not None:
-            chat_kwargs["_request_id"] = inference_request_id
+        inference_request_id = str(uuid.uuid4())
+        chat_kwargs["_request_id"] = inference_request_id
 
         if request.stream:
-            sse_headers = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
+            sse_headers = {
+                "X-Accel-Buffering": "no",
+                "Cache-Control": "no-cache",
+                _REQUEST_ID_HEADER: inference_request_id,
+            }
             if response_format_warning:
                 sse_headers["Warning"] = response_format_warning
             stream_state = _ResponsesStreamState()
@@ -8463,6 +8673,7 @@ async def create_response(
             raw_text = clean_special_tokens(output.text) if output.text else ""
             thinking_content, regular_content = extract_thinking(
                 raw_text,
+                leading_only=_leading_thinking_only(engine),
                 truncated=output.finish_reason == "length",
                 start_in_thinking=(
                     output.finish_reason == "length"
@@ -8590,9 +8801,9 @@ async def create_response(
 
             return response_obj.model_dump_json()
 
-        json_headers = (
-            {"Warning": response_format_warning} if response_format_warning else None
-        )
+        json_headers = {_REQUEST_ID_HEADER: inference_request_id}
+        if response_format_warning:
+            json_headers["Warning"] = response_format_warning
         return await _json_response_or_keepalive(
             http_request, _build_responses_api(), lease=lease, headers=json_headers
         )
@@ -8641,7 +8852,10 @@ async def stream_responses_api(
                 )
         except Exception as exc:
             logger.debug("Could not detect Responses stream thinking state: %s", exc)
-    thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
+    leading_only = _leading_thinking_only(engine)
+    thinking_parser = ThinkingParser(
+        start_in_thinking=start_in_thinking, leading_only=leading_only
+    )
     stream_state = stream_state or _ResponsesStreamState()
     seq = 0
 
@@ -9032,6 +9246,7 @@ async def stream_responses_api(
     elif has_tools and accumulated_text:
         thinking_content, regular_content = extract_thinking(
             accumulated_text,
+            leading_only=leading_only,
             truncated=last_output is not None and last_output.finish_reason == "length",
         )
         extraction = extract_tool_calls_with_thinking(
@@ -9072,6 +9287,7 @@ async def stream_responses_api(
         # No tools — use raw accumulated text minus thinking.
         thinking_content, regular_content = extract_thinking(
             accumulated_text,
+            leading_only=leading_only,
             truncated=last_output is not None and last_output.finish_reason == "length",
         )
         cleaned_text = clean_special_tokens(regular_content) if regular_content else ""

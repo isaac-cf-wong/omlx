@@ -1305,6 +1305,10 @@ def build_mlx_launch_argv(
         argv.append("--sampling-rank-only")
     if deployment.execution.async_overlap:
         argv.append("--async-overlap")
+    if deployment.execution.mtp:
+        argv.extend(["--mtp", "--mtp-depth", str(deployment.execution.mtp_depth)])
+        if deployment.execution.mtp_fixed_depth:
+            argv.append("--mtp-fixed-depth")
     if deployment.trust_remote_code:
         argv.append("--trust-remote-code")
     return argv
@@ -3380,8 +3384,13 @@ class DistributedJobSupervisor:
             f"distributed worker reported {event_type}: {reason or 'unknown failure'}"
         )
         if event_type == "rank_exit":
-            # A rank that fails before its marker exists leaves only stderr.
-            lines = tuple(self._stderr)[-20:]
+            # A rank that fails before its marker exists leaves only launcher
+            # output. Remote ranks run under ``ssh -tt``, so their stderr
+            # arrives on the launcher's stdout.
+            stdout = [
+                line for line in self._stdout if not line.startswith(_EVENT_PREFIX)
+            ]
+            lines = tuple(self._stderr)[-20:] + tuple(stdout[-20:])
             if lines:
                 detail += "\n" + "\n".join(lines)
         return detail

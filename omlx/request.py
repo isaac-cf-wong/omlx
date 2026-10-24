@@ -73,6 +73,11 @@ class SamplingParams:
     frequency_penalty: float = 0.0
     stop: Optional[List[str]] = None
     stop_token_ids: Optional[List[int]] = None
+    # Forced-length generation (benchmark use): when True the model's own
+    # EOS/EOT/generation_config stop tokens do not end generation — only
+    # max_tokens does. Request-level stop strings / stop_token_ids still
+    # stop as usual.
+    ignore_eos: bool = False
 
     # Logprobs settings (memory optimization: disabled by default)
     logprobs: bool = False  # Whether to return logprobs
@@ -153,6 +158,8 @@ class Request:
     # Paged cache fields (for BlockAwarePrefixCache)
     block_table: Optional["BlockTable"] = None  # Block table for paged cache
     shared_prefix_blocks: int = 0  # Number of shared prefix blocks
+    # Ordinary prefix reuse awaiting scheduling validation; None once recorded.
+    pending_prefix_cache_tokens: int | None = None
 
     # Memory-pressure requeue. The first ``requeued_output_tokens`` outputs
     # are folded into ``prompt_token_ids`` so re-admission prefills them;

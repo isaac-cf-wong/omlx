@@ -49,9 +49,11 @@ from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
 from ..model_settings import ane_prefill_backend, ane_prefill_fraction
 from ..models.vlm import VLMModelAdapter
+from ..patches import qwen35_packed_linear
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
 from ..patches.mlx_lm_mtp import drafter_target
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
+from ..patches.muse_spark import model as muse_spark_model
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..speculative.dflash import attach_drafter, detach_drafter
 from ..utils.image import (
@@ -221,6 +223,10 @@ def _apply_minimax_m3_thinking_mode(
     if enable_thinking is True:
         template_kwargs["thinking_mode"] = "enabled"
     elif enable_thinking is False:
+        template_kwargs["thinking_mode"] = "disabled"
+    elif str(template_kwargs.get("reasoning_effort", "")).strip().lower() == "none":
+        # MiniMax renders the effort level verbatim; "none" also turns
+        # thinking off, as the reference server does.
         template_kwargs["thinking_mode"] = "disabled"
 
 
@@ -2180,6 +2186,13 @@ class VLMBatchedEngine(BaseEngine):
                             )
                         ),
                     )
+                if model_type == "muse_spark":
+                    return muse_spark_model.load(
+                        self._model_name,
+                        lazy=getattr(
+                            self._model_settings, "moe_expert_offload_enabled", False
+                        ),
+                    )
                 if model_type == COHERE2_MOE_MODEL_TYPE:
                     return _load_cohere2_moe_text_model(
                         self._model_name,
@@ -2473,6 +2486,9 @@ class VLMBatchedEngine(BaseEngine):
                             True,
                         ),
                         install_dispatch=False,
+                        packed_projections=qwen35_packed_linear.enabled(
+                            self._vlm_model
+                        ),
                     )
 
                 ane_count = await loop.run_in_executor(
@@ -2486,8 +2502,6 @@ class VLMBatchedEngine(BaseEngine):
         # the M5 tensor units. Replaces the layers in place, so resident
         # memory does not grow; runs on the MLX executor before any forward.
         try:
-            from ..patches import qwen35_packed_linear
-
             if qwen35_packed_linear.enabled(self._vlm_model):
                 packed = await loop.run_in_executor(
                     get_mlx_executor(),
@@ -2615,11 +2629,18 @@ class VLMBatchedEngine(BaseEngine):
                 apply_turboquant_attention_patch()
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 scheduler._turboquant_kv_bits = tq_bits
+                scheduler._turboquant_kv_scheme = getattr(
+                    self._model_settings, "turboquant_kv_scheme", "turboquant"
+                )
                 scheduler._turboquant_skip_last = getattr(
                     self._model_settings, "turboquant_skip_last", True
                 )
                 scheduler._set_model_info_for_monitor()
-                logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
+                logger.info(
+                    "KV cache compression enabled for VLM: %s, %s bits",
+                    scheduler._turboquant_kv_scheme,
+                    tq_bits,
+                )
 
         # head_dim=256 long-context prefill -> O(L) tiled SDPA kernel. See
         # batched.py for rationale. Passthrough-safe; strictly gated route.
@@ -2773,8 +2794,8 @@ class VLMBatchedEngine(BaseEngine):
                         scheduler,
                         requested_ane_sequence_length,
                     )
-                    # Price the compiled I/O surfaces off the full model so
-                    # admission charges them while the banks are resident.
+                    # Price the compiled program weights off the full model
+                    # so admission charges them while the banks are resident.
                     monitor = getattr(scheduler, "memory_monitor", None)
                     if monitor is not None:
                         monitor.set_ane_prefill_transient_bytes(
@@ -4081,6 +4102,12 @@ class VLMBatchedEngine(BaseEngine):
         num_videos = len(videos) if videos else 0
 
         model_type = self.model_type or _read_config_model_type(self._model_name) or ""
+        if model_type == "flint" and (num_images or num_audios or num_videos):
+            raise InvalidRequestError(
+                "Flint is a text-only model and does not support "
+                "image, audio, or video input.",
+                field="messages",
+            )
         if model_type == COHERE2_MOE_MODEL_TYPE and (
             num_images > 0 or num_audios > 0
         ):
@@ -4886,6 +4913,7 @@ class VLMBatchedEngine(BaseEngine):
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            request_id=kwargs.pop("_request_id", None),
             vlm_inputs_embeds=vlm_inputs_embeds,
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,
@@ -4989,6 +5017,7 @@ class VLMBatchedEngine(BaseEngine):
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
+            ignore_eos=bool(kwargs.get("ignore_eos", False)),
             stop_token_ids=extra_stop_ids or None,
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
@@ -5220,11 +5249,11 @@ class VLMBatchedEngine(BaseEngine):
         _, text_messages, images, _, videos = self._extract_request_media(messages)
         if (
             images
-            and self.model_type in {"gemma4", "gemma4_unified"}
+            and self.model_type in {"gemma4", "gemma4_unified", "muse_spark"}
             and self._vlm_model.config.vision_config is None
         ):
             raise InvalidRequestError(
-                "This text-only Gemma 4 model does not support image input.",
+                "This text-only model does not support image input.",
                 field="messages",
             )
         prompt = self._apply_chat_template(
