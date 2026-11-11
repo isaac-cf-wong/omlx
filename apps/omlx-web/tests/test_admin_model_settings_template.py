@@ -112,6 +112,12 @@ def test_reasoning_effort_has_presets_and_custom_input():
 
     assert 'x-for="value in selectedModel?.reasoning_effort_options || []"' in section
     assert ':value="value" x-text="value"' in section
+    # x-model runs before x-for adds the options, so each option binds its own selection.
+    assert ':selected="value === entry.value"' in section
+    assert (
+        ':selected="!selectedModel?.reasoning_effort_options?.includes(entry.value)"'
+        in section
+    )
     assert "!selectedModel?.reasoning_effort_custom && !entry.custom" in section
 
 
@@ -450,6 +456,7 @@ def test_a8_prefill_toggle_is_gated_to_supported_models():
     )
     assert 'x-if="showsA8Prefill(selectedModel)"' in section
     assert "modelSettings.a8_prefill_enabled" in section
+    assert "modal.model_settings.qwen_oq_a8_quality_badge" in section
     # The detail controls only appear once the feature is on.
     assert 'x-show="modelSettings.a8_prefill_enabled"' in section
     assert "modelSettings.a8_prefill_min_tokens" in section
@@ -558,8 +565,8 @@ def test_profile_api_toggle_i18n_keys_exist_in_every_locale():
         missing = set(english) - set(catalog)
         assert not missing, f"{path.name} is missing {sorted(missing)}"
         if path.name == "zh.json":
-            # Simplified Chinese carries its own labels; every other locale
-            # keeps the English fallback until its own translation lands.
+            # Simplified Chinese carries its own labels; untranslated locales
+            # keep the English fallback until their own translation lands.
             assert catalog["modal.model_settings.profiles.expose_as_model_on"] == "开"
             assert catalog["modal.model_settings.profiles.expose_as_model_off"] == "关"
             continue
@@ -567,6 +574,10 @@ def test_profile_api_toggle_i18n_keys_exist_in_every_locale():
             # Czech carries its own labels (ZAP/VYP), same exemption as zh.
             assert catalog["modal.model_settings.profiles.expose_as_model_on"] == "ZAP"
             assert catalog["modal.model_settings.profiles.expose_as_model_off"] == "VYP"
+            continue
+        if path.name == "de.json":
+            assert catalog["modal.model_settings.profiles.expose_as_model_on"] == "EIN"
+            assert catalog["modal.model_settings.profiles.expose_as_model_off"] == "AUS"
             continue
         for key, value in english.items():
             assert (
