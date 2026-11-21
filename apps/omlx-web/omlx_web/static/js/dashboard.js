@@ -70,6 +70,7 @@
         'vlm_mtp_enabled',
         'vlm_mtp_draft_model',
         'vlm_mtp_draft_block_size',
+        'lora_adapter',
     ]);
     const DIFFUSION_UNSUPPORTED_CT_KWARGS = new Set([
         'enable_thinking',
@@ -115,7 +116,8 @@
         generated_tokens: { label: 'status.stat.generated_tokens', field: 'total_completion_tokens' },
     };
     // Static class strings so Tailwind keeps them; indexed by tile count.
-    const SERVING_STAT_GRID_CLASSES = ['', '', 'sm:grid-cols-2', 'sm:grid-cols-2 lg:grid-cols-3', 'sm:grid-cols-2 lg:grid-cols-4'];
+    // Phones pair the tiles two per row; wider screens step up to three or four.
+    const SERVING_STAT_GRID_CLASSES = ['', 'grid-cols-1', 'grid-cols-2', 'grid-cols-2 lg:grid-cols-3', 'grid-cols-2 lg:grid-cols-4'];
     // Accuracy bench presets: benchmark -> samples, where 0 is the full
     // dataset. `standard` is the default selection; `full` is built from the
     // catalogue.
@@ -179,10 +181,10 @@
             // Global settings
             globalSettings: {
                 base_path: '',
-                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
+                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, gpu_keep_warm_idle_window: 300, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
-                scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true },
+                scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', concurrent_priority: 'balanced' },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_unavailable: false, ssd_cache_max_size: 'auto', hot_cache_max_size: '0', hot_cache_write_through: false, ane_compile_cache: false, initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_precision: 'fp32' },
                 sampling: { max_context_window: 32768, max_context_window_policy: null, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '', expose_tools: true },
@@ -216,6 +218,7 @@
                     web_search_content_max_chars: 20000,
                     splash_path: null,
                     splash_kv_format: 'int8',
+                    splash_activations: 'bf16',
                     splash_max_memory_gb: null,
                     splash_ssd_cache_gb: null,
                     splash_ane_prefill: true,
@@ -331,6 +334,7 @@
             importingMtplx: false,
             loadingGenDefaults: false,
             reasoningParsers: [],
+            loraAdapters: [],
             aneTuning: {
                 tuningId: null,
                 modelId: null,
@@ -353,7 +357,7 @@
             _aneTuningPollTimer: null,
             // Prefill Accelerator: paired Macs that can help the open model,
             // and its helper status (polled while the modal is open).
-            prefillHelper: { modelId: null, candidates: [], version: '', loading: false, status: null, busy: false, original: null, applied: false },
+            prefillHelper: { modelId: null, candidates: [], loading: false, status: null, busy: false, original: null, applied: false },
             _prefillHelperPollTimer: null,
             // Set while this Mac runs another Mac's prefill helper.
             prefillLending: null,
@@ -635,6 +639,7 @@
             oqPreserveNgram: false,
             oqMtpAssistantPath: '',
             oqEnhanced: false,
+            oqHadamard: false,
             oqeReuseImatrixCache: true,
             oqeImatrixCachePath: '',
             oqeStrictImatrix: false,
@@ -695,7 +700,7 @@
             benchUploadResults: [],
             benchUploadDone: null,
             benchUploading: false,
-            benchUploadSkipped: null,  // { reason } — only external-endpoint runs skip now
+            benchUploadSkipped: null,  // { reason, features } from the upload_skipped event
             benchUploadFlags: [],      // [{key, label}] acceleration active during the run
             // { bench_id, model_id } when the server reports a running bench
             // that is NOT the one this tab is displaying. Drives the "another
@@ -785,6 +790,8 @@
             // endpoint settings because it is a simple number the user sets
             // once per endpoint (thinking models need a larger budget).
             accExternalMaxTokens: localStorage.getItem('omlx_acc_external_max_tokens') || '',
+            // Local runs: session-only, since a larger limit makes runs much longer.
+            accMaxTokens: '',
             accRunning: false,
             _managerStatusTimer: null,
             benchConfirm: null,      // 'throughput' | 'accuracy' | 'context' while asking
@@ -1464,6 +1471,7 @@
                             sse_keepalive_mode: this.globalSettings.server.sse_keepalive_mode,
                             burst_decode_mode: this.globalSettings.server.burst_decode_mode,
                             preserve_mid_system_cache: this.globalSettings.server.preserve_mid_system_cache,
+                            gpu_keep_warm_idle_window: this.globalSettings.server.gpu_keep_warm_idle_window,
                             distributed_inference_enabled: this.globalSettings.server.distributed_inference_enabled,
                             max_audio_upload_size: this.globalSettings.server.max_audio_upload_size,
                             model_dirs: this.globalSettings.model.model_dirs.filter(d => d.trim()),
@@ -1476,7 +1484,7 @@
                             embedding_batch_size: this.globalSettings.scheduler.embedding_batch_size,
                             chunked_prefill: this.globalSettings.scheduler.chunked_prefill,
                             prefill_priority: this.globalSettings.scheduler.prefill_priority,
-                            decode_fairness: this.globalSettings.scheduler.decode_fairness,
+                            concurrent_priority: this.globalSettings.scheduler.concurrent_priority,
                             cache_enabled: this.globalSettings.cache.enabled,
                             ssd_cache_dir: this.globalSettings.cache.ssd_cache_dir,
                             ssd_cache_max_size: this.globalSettings.cache.ssd_cache_max_size,
@@ -1528,7 +1536,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        this.saveError = Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || window.t('js.error.save_settings_failed'));
+                        this.saveError = this.formatApiError(data.detail) || window.t('js.error.save_settings_failed');
                         // Reload settings to revert to server values
                         await this.loadGlobalSettings();
                     }
@@ -1577,7 +1585,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        this.subKeyError = data.detail || window.t('js.error.save_settings_failed');
+                        this.subKeyError = this.formatApiError(data.detail) || window.t('js.error.save_settings_failed');
                     }
                 } catch (err) {
                     this.subKeyError = window.t('js.error.save_settings_failed');
@@ -1672,7 +1680,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(data.detail || window.t('js.error.update_model_setting_failed'));
+                        alert(this.formatApiError(data.detail) || window.t('js.error.update_model_setting_failed'));
                         await this.loadModels();
                     }
                 } catch (err) {
@@ -1910,6 +1918,35 @@
                 const profile = this.profiles.find(p => p.name === this.activeProfileName);
                 return this.matchingProfileTemplate(profile)?.name || null;
             },
+            async loadLoraAdapters(modelId) {
+                this.loraAdapters = [];
+                try {
+                    const r = await fetch(`/admin/api/models/${encodeURIComponent(modelId)}/lora-adapters`);
+                    if (r.ok) this.loraAdapters = (await r.json()).adapters || [];
+                    else if (r.status === 401) window.location.href = '/admin';
+                } catch (_) { /* network error */ }
+            },
+            loraAdapterOptions() {
+                const current = this.modelSettings.lora_adapter;
+                // A saved path outside the model folders still shows as selected.
+                if (current && !this.loraAdapters.some(a => a.path === current)) {
+                    return [{ id: current, path: current, problem: null }, ...this.loraAdapters];
+                }
+                return this.loraAdapters;
+            },
+            loraAdapterLabel(a) {
+                const parts = [a.id];
+                if (a.rank) parts.push('r' + a.rank);
+                if (a.size_formatted) parts.push(a.size_formatted);
+                return parts.join(' · ');
+            },
+            selectedLoraAdapter() {
+                const current = this.modelSettings.lora_adapter;
+                return current ? this.loraAdapters.find(a => a.path === current) || null : null;
+            },
+            loraAdapterProblem() {
+                return this.selectedLoraAdapter()?.problem || '';
+            },
             async loadProfilesForModel(modelId) {
                 const seq = this._applySeq;
                 this.profiles = [];
@@ -2137,6 +2174,31 @@
                 return v;
             },
 
+            // The admin API answers a pydantic validation error with an array
+            // of {loc, msg} objects. alert() on that array prints
+            // "[object Object]" and hides which field the server refused, so
+            // the settings endpoints that can return one render it here.
+            formatApiError(detail) {
+                if (!detail) return '';
+                if (Array.isArray(detail)) {
+                    return detail.map(item => {
+                        if (!item || typeof item !== 'object') return String(item);
+                        const loc = Array.isArray(item.loc) ? item.loc : [];
+                        const fields = ['body', 'query', 'path', 'header'].includes(loc[0])
+                            ? loc.slice(1) : loc;
+                        const path = fields.join('.');
+                        const message = String(item.msg || item.message || '')
+                            .replace(/^Value error, /, '');
+                        const text = message || JSON.stringify(item);
+                        return path ? `${path}: ${text}` : text;
+                    }).filter(Boolean).join('; ');
+                }
+                if (typeof detail === 'object') {
+                    return String(detail.message || detail.msg || JSON.stringify(detail));
+                }
+                return String(detail);
+            },
+
             buildCtKwargEntries(chatTemplateKwargs, forcedCtKwargs, isDiffusion = false) {
                 const ctk = chatTemplateKwargs || {};
                 const forced = new Set(forcedCtKwargs || []);
@@ -2293,6 +2355,7 @@
                     vlm_mtp_enabled: s.vlm_mtp_enabled || false,
                     vlm_mtp_draft_model: s.vlm_mtp_draft_model || '',
                     vlm_mtp_draft_block_size: s.vlm_mtp_draft_block_size ?? null,
+                    lora_adapter: isDiffusion ? '' : (s.lora_adapter || ''),
                     ctKwargEntries,
                     is_diffusion_model: isDiffusion,
                     external_engine: s.external_engine || '',
@@ -2508,7 +2571,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || window.t('js.error.save_profile_failed');
+                        this.profileError = this.formatApiError(data.detail) || window.t('js.error.save_profile_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -2635,7 +2698,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || window.t('js.error.update_profile_failed');
+                        this.profileError = this.formatApiError(data.detail) || window.t('js.error.update_profile_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -2676,7 +2739,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || window.t('js.error.save_template_failed');
+                        this.profileError = this.formatApiError(data.detail) || window.t('js.error.save_template_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -2702,7 +2765,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || window.t('js.error.update_template_failed');
+                        this.profileError = this.formatApiError(data.detail) || window.t('js.error.update_template_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -3001,7 +3064,7 @@
                         return;
                     }
                     if (!response.ok) {
-                        throw new Error(data.detail || window.t('js.error.apply_ane_tuning_result_failed'));
+                        throw new Error(this.formatApiError(data.detail) || window.t('js.error.apply_ane_tuning_result_failed'));
                     }
                     Object.assign(this.modelSettings, patch);
                     const model = this.models.find(item => item.id === this.selectedModel.id);
@@ -3056,6 +3119,7 @@
                     await Promise.all([
                         this.loadProfilesForModel(model.id),
                         this.loadTemplates(),
+                        this.loadLoraAdapters(model.id),
                     ]);
                     if (this.reasoningParsers.length === 0) {
                         try {
@@ -3129,7 +3193,6 @@
                 this.prefillHelper = {
                     modelId: model.id,
                     candidates: [],
-                    version: '',
                     loading: false,
                     status: model.prefill_helper || null,
                     busy: false,
@@ -3156,7 +3219,6 @@
                     if (resp.ok && this.prefillHelper.modelId === modelId) {
                         const data = await resp.json();
                         this.prefillHelper.candidates = data.devices || [];
-                        this.prefillHelper.version = data.version || '';
                     }
                 } catch (_) { /* network error */ }
                 if (this.prefillHelper.modelId === modelId) this.prefillHelper.loading = false;
@@ -3216,8 +3278,7 @@
                 if (!device.online) {
                     parts.push(window.t('modal.model_settings.prefill_helper_offline'));
                 } else if (!device.version_ok) {
-                    parts.push(window.t('modal.model_settings.prefill_helper_update')
-                        .replace('{version}', this.prefillHelper.version || ''));
+                    parts.push(window.t('modal.model_settings.prefill_helper_update'));
                 } else if (device.layers_fit > 0) {
                     parts.push(window.t('modal.model_settings.prefill_helper_fits')
                         .replace('{n}', device.layers_fit));
@@ -3333,12 +3394,15 @@
                             .replace('{size}', size(s.bytes));
                     case 'ready':
                     case 'working': {
+                        // No split beats this Mac alone over the measured link.
+                        if (s.layers === 0) return t('slow_link').replace('{name}', name);
                         let text = t(s.state).replace('{name}', name).replace('{n}', s.held ?? '');
                         if (s.last_prompt) {
                             text += ' · ' + t('last_prompt')
                                 .replace('{tokens}', Number(s.last_prompt.tokens).toLocaleString())
                                 .replace('{seconds}', Number(s.last_prompt.seconds).toFixed(1));
                         }
+                        if (s.out_of_memory) text += ' · ' + t('out_of_memory');
                         return text;
                     }
                     case 'offline':
@@ -3667,6 +3731,7 @@
                         && ms.vlm_mtp_draft_block_size
                         ? parseInt(ms.vlm_mtp_draft_block_size)
                         : null,
+                    lora_adapter: ms.lora_adapter || null,
                     trust_remote_code: ms.trust_remote_code,
                     external_engine: ms.external_engine || null,
                 };
@@ -3731,6 +3796,7 @@
                         vlm_mtp_enabled: false,
                         vlm_mtp_draft_model: null,
                         vlm_mtp_draft_block_size: null,
+                        lora_adapter: null,
                     });
                 }
                 if (this.selectedModel?.embedding_audio_supported) {
@@ -3809,8 +3875,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        // Request validation errors (422) carry a list of objects.
-                        alert(Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || window.t('js.error.save_model_settings_failed')));
+                        alert(this.formatApiError(data.detail) || window.t('js.error.save_model_settings_failed'));
                     }
                 } catch (err) {
                     console.error('Failed to save model settings:', err);
@@ -3859,7 +3924,7 @@
                     }
                     const data = await response.json().catch(() => ({}));
                     if (!response.ok) {
-                        this.settingsApply.error = data.detail || window.t('js.error.settings_apply_failed');
+                        this.settingsApply.error = this.formatApiError(data.detail) || window.t('js.error.settings_apply_failed');
                         this.settingsApply.phase = 'error';
                         return null;
                     }
@@ -4745,6 +4810,7 @@
                             web_search_content_max_chars: this.globalSettings.integrations.web_search_content_max_chars,
                             splash_path: this.globalSettings.integrations.splash_path,
                             splash_kv_format: this.globalSettings.integrations.splash_kv_format,
+                            splash_activations: this.globalSettings.integrations.splash_activations,
                             splash_max_memory_gb: this.globalSettings.integrations.splash_max_memory_gb,
                             splash_ssd_cache_gb: this.globalSettings.integrations.splash_ssd_cache_gb,
                             splash_ane_prefill: this.globalSettings.integrations.splash_ane_prefill,
@@ -5344,8 +5410,8 @@
 
             // Optional accuracy-only floor for per-question max_tokens.
             // Returns null when unset; throws on invalid input.
-            parseAccuracyMaxTokens() {
-                const raw = this.accExternalMaxTokens.trim();
+            parseAccuracyMaxTokens(input) {
+                const raw = input.trim();
                 if (!raw) return null;
                 const value = Number(raw);
                 if (!Number.isInteger(value) || value < 1 || value > 1000000) {
@@ -5358,7 +5424,7 @@
                 const body = this.externalRequestBody();
                 const extraBody = this.parseAccuracyExtraBody();
                 if (Object.keys(extraBody).length > 0) body.extra_body = extraBody;
-                const maxTokens = this.parseAccuracyMaxTokens();
+                const maxTokens = this.parseAccuracyMaxTokens(this.accExternalMaxTokens);
                 if (maxTokens !== null) body.max_tokens_override = maxTokens;
                 return body;
             },
@@ -6034,6 +6100,17 @@
                 return window.t(keys[profile] || keys.code_python);
             },
 
+            benchUploadSkippedLabel(reason) {
+                const keys = {
+                    external_endpoint: 'bench.upload_skipped.reason_external',
+                    splash: 'bench.upload_skipped.reason_splash',
+                    ane_aligned_prompt: 'bench.upload_skipped.reason_ane_aligned_prompt',
+                    custom_generation_length: 'bench.upload_skipped.reason_custom_generation_length',
+                    lora_adapter: 'bench.upload_skipped.reason_lora_adapter',
+                };
+                return window.t(keys[reason] || 'bench.upload_skipped.reason_default');
+            },
+
             // User clicked "View live" on the banner — clear the stale
             // result display, attach to the active run. The replay-on-
             // subscribe stream re-delivers every event so the new bench
@@ -6205,6 +6282,7 @@
 
             async addToAccQueue() {
                 let externalRequest = null;
+                let maxTokensOverride = null;
                 if (this.accExternalEnabled) {
                     if (!this.externalConfigValid()) {
                         this.accError = window.t('js.error.external_endpoint_required');
@@ -6218,6 +6296,14 @@
                     }
                 } else if (!this.accModelId) {
                     return;
+                } else {
+                    try {
+                        maxTokensOverride = this.parseAccuracyMaxTokens(this.accMaxTokens);
+                    } catch (err) {
+                        this.accAdvancedOptionsOpen = true;
+                        this.accError = err.message;
+                        return;
+                    }
                 }
                 const selected = Object.entries(this.accBenchmarks)
                     .filter(([_, v]) => v)
@@ -6238,6 +6324,7 @@
                             batch_size: this.accBatchSize,
                             enable_thinking: this.accExternalEnabled ? false : this.accEnableThinking,
                             sampling_profile: this.accSamplingProfile,
+                            max_tokens_override: maxTokensOverride,
                             external: externalRequest,
                         }),
                     });
@@ -6492,8 +6579,8 @@
                         window.t('acc_bench.results.text_export.model')
                             .replace('{model}', () => m)
                     );
-                    lines.push(rpad(window.t('acc_bench.results.text_export.benchmark'), 16) + pad(window.t('acc_bench.results.text_export.accuracy'), 10) + pad(window.t('acc_bench.results.text_export.correct'), 10) + pad(window.t('acc_bench.results.text_export.total'), 8) + pad('Time(s)', 10) + pad(window.t('acc_bench.results.text_export.think'), 8));
-                    lines.push('-'.repeat(62));
+                    lines.push(rpad(window.t('acc_bench.results.text_export.benchmark'), 16) + pad(window.t('acc_bench.results.text_export.accuracy'), 10) + pad(window.t('acc_bench.results.text_export.correct'), 10) + pad(window.t('acc_bench.results.text_export.total'), 8) + pad('Time(s)', 10) + pad(window.t('acc_bench.results.text_export.think'), 8) + pad('MaxTok', 9));
+                    lines.push('-'.repeat(71));
                     for (const r of this.accAllResults.filter(r => r.model_id === m)) {
                         lines.push(
                             rpad(r.benchmark.toUpperCase(), 16) +
@@ -6503,7 +6590,8 @@
                             pad(r.time_s, 10) +
                             pad(r.thinking_used
                                 ? window.t('acc_bench.results.text_export.yes')
-                                : window.t('acc_bench.results.text_export.no'), 8)
+                                : window.t('acc_bench.results.text_export.no'), 8) +
+                            pad(r.external ? '-' : (r.max_tokens || '-'), 9)
                         );
                         if (r.external) {
                             lines.push(
@@ -6560,6 +6648,7 @@
                         total: r.total,
                         time_s: r.time_s,
                         thinking_used: r.thinking_used || false,
+                        max_tokens: r.max_tokens,
                         category_scores: r.category_scores || null,
                         questions: qr,
                     };
@@ -7826,7 +7915,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || window.t('js.error.save_failed')));
+                        alert(this.formatApiError(data.detail) || window.t('js.error.save_failed'));
                     }
                 } catch (err) {
                     console.error('Failed to save HF mirror endpoint:', err);
@@ -8172,6 +8261,7 @@
                     };
                     if (this.oqEnhanced) {
                         payload.enhanced = true;
+                        payload.hadamard = this.oqHadamardActive();
                         payload.imatrix_reuse_cache = this.oqeReuseImatrixCache;
                         payload.imatrix_cache_path = this.oqeImatrixCachePath.trim();
                         payload.imatrix_strict = this.oqeStrictImatrix;
@@ -8185,7 +8275,7 @@
                     if (response.ok) {
                         const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                         const name = model ? model.name : this.oqSelectedModelPath;
-                        this.oqSuccess = window.t('models.oq.quantization_started').replace('{name}', name).replace('{model}', 'oQ' + this.oqLevel + (this.oqEnhanced ? 'e' : ''));
+                        this.oqSuccess = window.t('models.oq.quantization_started').replace('{name}', name).replace('{model}', this.oqLevelLabel(this.oqLevel));
                         await this.loadOQTasks();
                         this.startOQRefresh();
                         setTimeout(() => { this.oqSuccess = ''; }, 5000);
@@ -8334,7 +8424,18 @@
             },
 
             oqLevelLabel(level) {
-                return `oQ${level}${this.oqEnhanced ? 'e' : ''}`;
+                return `oQ${level}${this.oqHadamardActive() ? 'h' : (this.oqEnhanced ? 'e' : '')}`;
+            },
+
+            oqSelectedModelSupportsOqh() {
+                const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                if (!model?.oqh_supported) return false;
+                // DeepSeek V4.1 takes oQh below oQ4 only.
+                return model.oqh_max_level == null || this.oqLevel < model.oqh_max_level;
+            },
+
+            oqHadamardActive() {
+                return this.oqEnhanced && this.oqHadamard && this.oqSelectedModelSupportsOqh();
             },
 
             oqSelectedModelIsVLM() {
@@ -9170,7 +9271,7 @@
             // A downloaded checkpoint with Hub changes offers Update instead of the download buttons.
             hfShowsUpdate() {
                 const detail = this.hfModelDetail;
-                return !!(detail && !detail.is_adapter && !detail.unsupported_reason && detail.layout !== 'gguf'
+                return !!(detail && !detail.unsupported_reason && detail.layout !== 'gguf'
                     && detail.update_files?.length && this.isModelDownloaded(detail.repo_id));
             },
 

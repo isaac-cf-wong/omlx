@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
+import numpy as np
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import (
@@ -49,6 +50,7 @@ from ..api.utils import (
 from ..cache.paged_ssd_cache import numerics_revision_for_model
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
+from ..lora_adapters import apply_adapter
 from ..model_settings import (
     a8_prefill_on,
     ane_prefill_backend,
@@ -56,21 +58,24 @@ from ..model_settings import (
     ced_prefill_on,
 )
 from ..models.vlm import VLMModelAdapter
+from ..oqh.format import is_oqh_checkpoint
 from ..patches import qwen35_packed_linear
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
+from ..patches.inkling2 import INKLING2_MODEL_TYPES
+from ..patches.inkling2 import vlm as inkling2_vlm
 from ..patches.mlx_lm_mtp import drafter_target
 from ..patches.mlx_vlm_minimax_m3_compat import a8 as minimax_a8
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 from ..patches.muse_spark import model as muse_spark_model
-from ..prefill_helper.adapters import adapter_for as stage_adapter_for
+from ..prefill_helper.adapters import adapter_for_model as stage_adapter_for
 from ..prefill_helper.manager import PrefillHelperManager
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..speculative.dflash import attach_drafter, detach_drafter
 from ..utils.image import (
-    compute_image_hash,
     compute_per_image_hashes,
     extract_images_from_messages,
     extract_media_from_messages,
+    image_hash_prefixes,
 )
 from ..utils.video import (
     NATIVE_VIDEO_MODEL_TYPES,
@@ -275,6 +280,37 @@ def _apply_minimax_m3_thinking_mode(
         template_kwargs["thinking_mode"] = "disabled"
 
 
+_HY_V4_THINKING_OFF = {"none", "off", "no_think"}
+
+
+def _apply_hy_v4_reasoning_mode(
+    model_type: str | None,
+    template_kwargs: dict[str, Any],
+) -> None:
+    """Map oMLX thinking switches to Hy4's reasoning_effort (no_think / high).
+
+    The Hy4 template raises on any other effort value, and the generic
+    fallback would then render its default ``high``, so an explicit "off"
+    must become ``no_think`` here.
+    """
+    if model_type not in ("hy_v4_vl", "hy_v4_flash"):
+        return
+    enable_thinking = template_kwargs.pop("enable_thinking", None)
+    effort = template_kwargs.get("reasoning_effort")
+    off = isinstance(effort, str) and effort.strip().lower() in _HY_V4_THINKING_OFF
+    if off or (effort is None and enable_thinking is False):
+        template_kwargs["reasoning_effort"] = "no_think"
+
+
+def _apply_template_thinking_mode(
+    model_type: str | None,
+    template_kwargs: dict[str, Any],
+) -> None:
+    """Translate oMLX thinking switches into model-specific template kwargs."""
+    _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
+    _apply_hy_v4_reasoning_mode(model_type, template_kwargs)
+
+
 def _attach_vlm_tokenizer_runtime(tokenizer: Any, model_path: Path, eos_token_id: Any):
     from mlx_vlm.tokenizer_utils import load_tokenizer
     from mlx_vlm.utils import StoppingCriteria
@@ -294,12 +330,16 @@ def _attach_vlm_tokenizer_runtime(tokenizer: Any, model_path: Path, eos_token_id
     return tokenizer
 
 
-def _load_cohere2_moe_text_model(
+def _load_text_model_with_tokenizer_fallback(
     model_name: str,
     *,
     trust_remote_code: bool = False,
 ):
-    """Load Cohere2 MoE through mlx-vlm with a tokenizer-only fallback."""
+    """Load a text-only mlx-vlm family with a tokenizer-only fallback.
+
+    Used when the checkpoint's processor class is missing from the installed
+    transformers (Cohere2 MoE).
+    """
     from mlx_vlm.utils import get_model_path, load_model, load_processor
     from transformers import AutoTokenizer
 
@@ -321,7 +361,7 @@ def _load_cohere2_moe_text_model(
         )
     except Exception as exc:
         logger.debug(
-            "mlx-vlm processor load failed for Cohere2 MoE %s; "
+            "mlx-vlm processor load failed for %s; "
             "falling back to AutoTokenizer: %s",
             model_name,
             exc,
@@ -1588,6 +1628,8 @@ def _count_image_tokens_real(
     minp = getattr(ip, "min_pixels", None)
     maxp = getattr(ip, "max_pixels", None)
     qwen_ok = all(isinstance(x, int) and x > 0 for x in (ps, ms, minp, maxp))
+    # Processors with extra placeholder tokens (Hy4's row newlines) count exactly.
+    token_counter = getattr(ip, "count_image_tokens", None)
     patch_counter = getattr(ip, "get_number_of_image_patches", None)
     glm_ok = (
         callable(patch_counter)
@@ -1613,8 +1655,13 @@ def _count_image_tokens_real(
 
     total = 0
     for wh in dimensions:
-        if wh is None or not (qwen_ok or glm_ok):
+        if wh is None or not (qwen_ok or glm_ok or callable(token_counter)):
             total += upper_bound
+        elif callable(token_counter):
+            try:
+                total += int(token_counter(wh[1], wh[0]))
+            except Exception:
+                total += upper_bound
         elif glm_ok:
             try:
                 total += int(patch_counter(wh[1], wh[0]) // (ms**2))
@@ -1639,9 +1686,6 @@ def _audio_feature_cache_key_ranges(
     hashed without its batch padding (clips are padded to the longest one in
     the request), so a clip keeps its key when a later turn adds a longer one.
     """
-    import hashlib
-
-    import numpy as np
 
     def _to_np(value):
         if isinstance(value, mx.array):
@@ -1702,6 +1746,34 @@ def _audio_feature_cache_key_ranges(
         else:
             ranges.append((start, key))
     return ranges
+
+
+def wire_moe_offload_slot_hooks(scheduler, model) -> bool:
+    """Give every sized release/restore target under ``model`` the shared hooks.
+
+    DeepSeek V4.1 keeps its expert banks outside ``ExpertCache``. An engine
+    that offloaded both kinds gets one hook over the union, so wiring the banks
+    never drops the caches' hook. Returns whether anything was wired.
+    """
+    slots = getattr(model, "_moe_offload_slots", None) or []
+    if not slots:
+        return False
+    from ..patches.moe_expert_offload import (
+        moe_offload_caches,
+        releasable_moe_offload_bytes,
+        release_moe_offload_slots,
+        restore_moe_offload_slots,
+    )
+
+    banks = [*moe_offload_caches(model), *slots]
+    scheduler.moe_offload_release = functools.partial(
+        release_moe_offload_slots, banks
+    )
+    scheduler.moe_offload_restore = functools.partial(restore_moe_offload_slots, banks)
+    scheduler.moe_offload_releasable = functools.partial(
+        releasable_moe_offload_bytes, banks
+    )
+    return True
 
 
 class VLMBatchedEngine(BaseEngine):
@@ -2081,6 +2153,8 @@ class VLMBatchedEngine(BaseEngine):
                             getattr(self._model_settings, "a8_prefill_min_tokens", 128)
                         ),
                     )
+                if model_type in INKLING2_MODEL_TYPES:
+                    return inkling2_vlm.load(self._model_name)
                 if model_type == "muse_spark":
                     return muse_spark_model.load(
                         self._model_name,
@@ -2089,7 +2163,7 @@ class VLMBatchedEngine(BaseEngine):
                         ),
                     )
                 if model_type == COHERE2_MOE_MODEL_TYPE:
-                    return _load_cohere2_moe_text_model(
+                    return _load_text_model_with_tokenizer_fallback(
                         self._model_name,
                         trust_remote_code=self._trust_remote_code,
                     )
@@ -2161,12 +2235,14 @@ class VLMBatchedEngine(BaseEngine):
         # BEFORE materialize so non-resident experts never load.
         moe_offload_wrapped = 0
         offload_stats = offload_release = offload_restore = None
+        offload_releasable = None
         if getattr(self._model_settings, "moe_expert_offload_enabled", False):
             from ..patches.moe_expert_offload import (
                 apply_moe_expert_offload,
                 materialize_offload_state,
                 moe_offload_caches,
                 moe_offload_stats,
+                releasable_moe_offload_bytes,
                 release_moe_offload_slots,
                 restore_moe_offload_slots,
             )
@@ -2210,6 +2286,9 @@ class VLMBatchedEngine(BaseEngine):
                 offload_stats = functools.partial(moe_offload_stats, caches=caches)
                 offload_release = functools.partial(release_moe_offload_slots, caches)
                 offload_restore = functools.partial(restore_moe_offload_slots, caches)
+                offload_releasable = functools.partial(
+                    releasable_moe_offload_bytes, caches
+                )
         self._moe_offload_wrapped = moe_offload_wrapped
 
         # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
@@ -2246,6 +2325,15 @@ class VLMBatchedEngine(BaseEngine):
         except Exception:
             logger.debug("t5 bias free skipped", exc_info=True)
 
+        # After the fp16 recast so the adapter takes the activation dtype, and
+        # before the fusions and packers that replace the projections.
+        lora_path = getattr(self._model_settings, "lora_adapter", None)
+        if lora_path:
+            wrapped = await loop.run_in_executor(
+                get_mlx_executor(), apply_adapter, self._vlm_model, lora_path
+            )
+            logger.info("LoRA adapter %s: %d projections", lora_path, wrapped)
+
         # Supported MoE gate+up regroup: concatenate the routed experts'
         # gate and up projections so decode runs 2 gather_qmm launches per
         # MoE layer instead of 3 (issue #2238). Bit-exact; also swaps the
@@ -2277,10 +2365,12 @@ class VLMBatchedEngine(BaseEngine):
         # class hooks are installed later, outside the other Qwen class patches.
         ane_count = 0
         requested_ane_sequence_length = 2048
-        if (
-            getattr(self._model_settings, "qwen35_ane_prefill_enabled", False)
-            and ane_prefill_backend(self.model_type) == "qwen"
-        ):
+        # A8 and ANE prefill read affine weights; oQh linears have none.
+        oqh = is_oqh_checkpoint(self._model_name)
+        ane_on = getattr(self._model_settings, "qwen35_ane_prefill_enabled", False)
+        if ane_on and oqh:
+            logger.warning("ANE prefill does not read oQh weights; it stays off")
+        elif ane_on and ane_prefill_backend(self.model_type) == "qwen":
             ane_fraction = ane_prefill_fraction(
                 self._model_settings.qwen35_ane_prefill_fraction, self.model_type
             )
@@ -2506,7 +2596,7 @@ class VLMBatchedEngine(BaseEngine):
         await self._engine.engine.start()
 
         scheduler = self._engine.engine.scheduler
-        stage_adapter = stage_adapter_for(self.model_type)
+        stage_adapter = stage_adapter_for(self.model_type, "vlm", self._model_name)
         if stage_adapter is not None:
             self._prefill_helper = PrefillHelperManager(
                 model_path=self._model_name,
@@ -2516,12 +2606,18 @@ class VLMBatchedEngine(BaseEngine):
                 attach=scheduler.attach_prefill_helper,
                 chunk_tokens=scheduler._base_prefill_step_size(0, 1 << 30),
             )
+            scheduler._prefill_helper_retry = self._prefill_helper.retry_if_offline
             self.configure_prefill_helper(self._model_settings)
 
         # TurboQuant KV cache
         scheduler.moe_offload_stats = offload_stats
         scheduler.moe_offload_release = offload_release
         scheduler.moe_offload_restore = offload_restore
+        scheduler.moe_offload_releasable = offload_releasable
+        # DeepSeek V4.1 keeps its expert banks outside ExpertCache; give them
+        # the same sized release/restore hooks so a long prefill can borrow
+        # their slots and the next decode step grows them back.
+        wire_moe_offload_slot_hooks(scheduler, self._vlm_model)
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
             if tq_enabled and self.model_type == "glm5_next":
@@ -2659,6 +2755,16 @@ class VLMBatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("Flint decode patch not applied", exc_info=True)
 
+        # Gemma 4 MoE (26B-A4B): top-k routing and the weighted combine in one
+        # launch each per layer, for decode and speculative verify rows.
+        if self.model_type == "gemma4":
+            try:
+                from ..patches.gemma4_moe_decode import apply_gemma4_moe_decode_patch
+
+                apply_gemma4_moe_decode_patch()
+            except Exception:
+                logger.debug("Gemma 4 MoE decode patch not applied", exc_info=True)
+
         # LFM3 text tower (shared by LFM3, -VL, -Audio and -Omni): one-launch
         # RoPE instead of about fifteen array ops per q/k call.
         if self.model_type in ("lfm3", "lfm3_vl", "lfm3_audio", "lfm3_omni"):
@@ -2696,6 +2802,9 @@ class VLMBatchedEngine(BaseEngine):
         # the patch itself falls through for anything it cannot route.
         # DeepSeek V4.1 applies the setting in its own loader.
         a8_on = a8_prefill_on(self._model_settings)
+        if a8_on and oqh:
+            logger.warning("A8 prefill does not read oQh weights; it stays off")
+            a8_on = False
         if a8_on and self.model_type in MINIMAX_M3_MODEL_TYPES:
             tagged = minimax_a8.tag(
                 self._vlm_model,
@@ -2771,6 +2880,17 @@ class VLMBatchedEngine(BaseEngine):
                 apply_qwen35_ragged_decode_patch()
             except Exception:
                 logger.debug("qwen3_5 ragged decode patch not applied", exc_info=True)
+
+        # Padded batches the ragged/verify kernels refuse -> batch-1 attention
+        # per row. Applied after the patches above so it wraps them.
+        try:
+            from ..patches.qwen35_padded_row_attention import (
+                apply_qwen35_padded_row_attention_patch,
+            )
+
+            apply_qwen35_padded_row_attention_patch()
+        except Exception:
+            logger.debug("qwen3_5 padded-row attention patch not applied", exc_info=True)
         scheduler.refresh_ssd_layer_signature()
 
         # SpecPrefill: load draft model and pass to scheduler
@@ -3170,7 +3290,7 @@ class VLMBatchedEngine(BaseEngine):
         num_images: int,
         num_audios: int = 0,
         num_videos: int = 0,
-    ) -> tuple[list[dict[str, Any]], list[tuple[int, int]]]:
+    ) -> tuple[list[dict[str, Any] | str], list[tuple[int, int]]]:
         """Format VLM messages with image/audio/video tokens on media-bearing user turns."""
         from mlx_vlm.prompt_utils import extract_text_from_content, get_message_json
 
@@ -3207,7 +3327,7 @@ class VLMBatchedEngine(BaseEngine):
         remaining_audios = num_audios
         assigned_fallback_images = False
         assigned_fallback_audios = False
-        formatted_messages: list[dict[str, Any]] = []
+        formatted_messages: list[dict[str, Any] | str] = []
         image_message_ranges: list[tuple[int, int]] = []
 
         for idx, msg in enumerate(messages):
@@ -3452,6 +3572,11 @@ class VLMBatchedEngine(BaseEngine):
                     num_images=msg_num_images,
                     num_audios=msg_num_audios,
                 )
+                # Prompt-only message formats render a plain string instead of a
+                # role/content dict; there is no content list to collapse.
+                if isinstance(formatted, str):
+                    formatted_messages.append(formatted)
+                    continue
                 # Collapse text-only list content to plain string so that
                 # simplified chat templates (without render_content macro)
                 # can handle it. Image/audio parts stay as a list.
@@ -4132,6 +4257,12 @@ class VLMBatchedEngine(BaseEngine):
                 field="messages",
             )
 
+        cumulative_hashes = image_hash_prefixes(images)
+        if model_type == QWEN4_EXP_MODEL_TYPE:
+            # 0.8.0 and 0.8.1 stored Qwen4 image KV without the h/w MRoPE axes.
+            # A new image key keeps those cached blocks from being restored.
+            cumulative_hashes = [f"{h}:mrope-hw" for h in cumulative_hashes]
+
         # Normalize audio to numpy float32 arrays expected by processor.
         # Request-facing string paths are rejected before this point; remaining
         # sources are inline buffers, arrays, or (array, sample_rate) tuples.
@@ -4209,6 +4340,11 @@ class VLMBatchedEngine(BaseEngine):
         # _format_messages_for_vlm_template(), so a residual key can survive
         # formatting; the chat template must never see the non-standard field.
         detect_and_strip_partial(formatted_messages)
+        # Prompt-only formats have no chat template. Like mlx-vlm
+        # apply_chat_template(), use the last rendered message as the prompt.
+        prompt_only = bool(formatted_messages) and all(
+            isinstance(message, str) for message in formatted_messages
+        )
         template_kwargs = {
             "tokenize": False,
             "add_generation_prompt": not is_partial,
@@ -4223,54 +4359,57 @@ class VLMBatchedEngine(BaseEngine):
             template_kwargs["tools"] = tools
         if chat_template_kwargs:
             template_kwargs.update(chat_template_kwargs)
-        _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
+        _apply_template_thinking_mode(model_type, template_kwargs)
 
         template_target = self._chat_template_target(model_type)
-        try:
-            prompt = apply_chat_template_with_reasoning_effort_fallback(
-                template_target,
-                formatted_messages,
-                template_kwargs,
-                is_harmony=model_type == "gpt_oss",
-            )
-        except TypeError:
-            # Fallback: template doesn't support some kwargs
-            if chat_template_kwargs:
-                for key in chat_template_kwargs:
-                    template_kwargs.pop(key, None)
-            template_kwargs.pop("enable_thinking", None)
-            prompt = template_target.apply_chat_template(
-                formatted_messages, **template_kwargs
-            )
-        except ValueError as exc:
-            if not _is_missing_chat_template_error(exc):
-                raise
-            # Processor/tokenizer has apply_chat_template but no chat_template
-            # set. Some OCR checkpoints (e.g. raw baidu/Unlimited-OCR) ship no
-            # chat template at all. mlx-vlm's get_chat_template handles this by
-            # rendering the messages into a plain prompt (the <image> tokens are
-            # already in the message content from get_message_json), preferring
-            # processor.chat_template -> processor.tokenizer.chat_template ->
-            # plain rendering, so it subsumes the tokenizer fallback too.
-            template_kwargs.pop("tokenize", None)
-            template_kwargs.pop("add_generation_prompt", None)
-            # get_chat_template() has no continue_final_message equivalent, so
-            # partial mode cannot be honoured on this fallback. Drop the kwarg
-            # and say so rather than passing it through as an unknown argument.
-            template_kwargs.pop("continue_final_message", None)
-            if is_partial:
-                logger.warning(
-                    "Partial mode requested but %s exposes no chat template; "
-                    "mlx-vlm plain rendering always starts a new assistant "
-                    "turn, so the final message will not be continued.",
-                    self._model_name,
+        if prompt_only:
+            prompt = formatted_messages[-1]
+        else:
+            try:
+                prompt = apply_chat_template_with_reasoning_effort_fallback(
+                    template_target,
+                    formatted_messages,
+                    template_kwargs,
+                    is_harmony=model_type == "gpt_oss",
                 )
-            prompt = get_chat_template(
-                self._processor,
-                formatted_messages,
-                add_generation_prompt=True,
-                **template_kwargs,
-            )
+            except TypeError:
+                # Fallback: template doesn't support some kwargs
+                if chat_template_kwargs:
+                    for key in chat_template_kwargs:
+                        template_kwargs.pop(key, None)
+                template_kwargs.pop("enable_thinking", None)
+                prompt = template_target.apply_chat_template(
+                    formatted_messages, **template_kwargs
+                )
+            except ValueError as exc:
+                if not _is_missing_chat_template_error(exc):
+                    raise
+                # Processor/tokenizer has apply_chat_template but no chat_template
+                # set. Some OCR checkpoints (e.g. raw baidu/Unlimited-OCR) ship no
+                # chat template at all. mlx-vlm's get_chat_template handles this by
+                # rendering the messages into a plain prompt (the <image> tokens are
+                # already in the message content from get_message_json), preferring
+                # processor.chat_template -> processor.tokenizer.chat_template ->
+                # plain rendering, so it subsumes the tokenizer fallback too.
+                template_kwargs.pop("tokenize", None)
+                template_kwargs.pop("add_generation_prompt", None)
+                # get_chat_template() has no continue_final_message equivalent, so
+                # partial mode cannot be honoured on this fallback. Drop the kwarg
+                # and say so rather than passing it through as an unknown argument.
+                template_kwargs.pop("continue_final_message", None)
+                if is_partial:
+                    logger.warning(
+                        "Partial mode requested but %s exposes no chat template; "
+                        "mlx-vlm plain rendering always starts a new assistant "
+                        "turn, so the final message will not be continued.",
+                        self._model_name,
+                    )
+                prompt = get_chat_template(
+                    self._processor,
+                    formatted_messages,
+                    add_generation_prompt=True,
+                    **template_kwargs,
+                )
 
         # Images with cached features and grids skip the image processor.
         fast_cached_features = None
@@ -4348,7 +4487,7 @@ class VLMBatchedEngine(BaseEngine):
                     prefix_template_kwargs["tools"] = tools
                 if chat_template_kwargs:
                     prefix_template_kwargs.update(chat_template_kwargs)
-                _apply_minimax_m3_thinking_mode(model_type, prefix_template_kwargs)
+                _apply_template_thinking_mode(model_type, prefix_template_kwargs)
 
                 images_consumed = 0
                 for msg_idx, msg_num_images in image_message_ranges:
@@ -4403,7 +4542,7 @@ class VLMBatchedEngine(BaseEngine):
                             boundary_tokens += 1
 
                     images_consumed += msg_num_images
-                    cumulative_hash = compute_image_hash(images[:images_consumed])
+                    cumulative_hash = cumulative_hashes[images_consumed - 1]
                     image_cache_key_ranges.append((boundary_tokens, cumulative_hash))
 
                 # A later image's prefix can diverge earlier. Its cumulative
@@ -4435,9 +4574,12 @@ class VLMBatchedEngine(BaseEngine):
         }
 
         # Check for any multimodal inputs. Most processors expose audio as
-        # ``input_features``; MiMo's tokenizer produces discrete ``audio_codes``.
+        # ``input_features``; MiMo's tokenizer produces discrete
+        # ``audio_codes``, and Nemotron-3 Nano Omni passes raw waveforms as
+        # ``sound_clips``.
         has_audio = any(
-            key in extra_model_inputs for key in ("input_features", "audio_codes")
+            key in extra_model_inputs
+            for key in ("input_features", "audio_codes", "sound_clips")
         )
         has_video = extra_model_inputs.get("pixel_values_videos") is not None
         has_multimodal = (
@@ -4455,7 +4597,7 @@ class VLMBatchedEngine(BaseEngine):
             image_hash = None
             image_token_count = None
             if num_images > 0:
-                image_hash = compute_image_hash(images)
+                image_hash = cumulative_hashes[-1]
                 image_token_count = self._image_token_count(input_ids)
             elif has_video:
                 image_cache_key_ranges = self._video_cache_key_ranges(
@@ -4659,6 +4801,32 @@ class VLMBatchedEngine(BaseEngine):
                 )
                 image_cache_key_start = image_cache_key_ranges[0][0]
                 image_hash = image_cache_key_ranges[-1][1]
+            elif has_audio and "sound_clips" in extra_model_inputs:
+                # Nemotron returns raw float32 waveforms. Right-pad them into
+                # one masked batch so each clip keys on its own samples.
+                clips = [
+                    np.asarray(c, dtype=np.float32).reshape(-1)
+                    for c in extra_model_inputs["sound_clips"]
+                ]
+                # Never empty: the processor omits the key when audio is None.
+                width = max(len(c) for c in clips)
+                padded = np.zeros((len(clips), width), dtype=np.float32)
+                mask = np.zeros((len(clips), width), dtype=bool)
+                for i, c in enumerate(clips):
+                    padded[i, : len(c)] = c
+                    mask[i, : len(c)] = True
+                image_ranges = image_cache_key_ranges
+                if image_hash is not None and not image_ranges:
+                    image_ranges = [(0, image_hash)]
+                image_cache_key_ranges = _audio_feature_cache_key_ranges(
+                    token_ids,
+                    padded,
+                    mask,
+                    getattr(self._vlm_model.config, "sound_context_token_id", None),
+                    image_ranges,
+                )
+                image_cache_key_start = image_cache_key_ranges[0][0]
+                image_hash = image_cache_key_ranges[-1][1]
             elif has_audio and "input_features" in extra_model_inputs:
                 image_ranges = image_cache_key_ranges
                 if image_hash is not None and not image_ranges:
@@ -4730,7 +4898,7 @@ class VLMBatchedEngine(BaseEngine):
                 template_kwargs["enable_thinking"] = self._enable_thinking
             if chat_template_kwargs:
                 template_kwargs.update(chat_template_kwargs)
-            _apply_minimax_m3_thinking_mode(self.model_type, template_kwargs)
+            _apply_template_thinking_mode(self.model_type, template_kwargs)
 
             try:
                 return apply_chat_template_with_reasoning_effort_fallback(
@@ -5747,7 +5915,7 @@ class VLMBatchedEngine(BaseEngine):
             template_kwargs["tools"] = tools
         if chat_template_kwargs:
             template_kwargs.update(chat_template_kwargs)
-        _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
+        _apply_template_thinking_mode(model_type, template_kwargs)
 
         template_target = self._chat_template_target(model_type)
         try:
@@ -6149,19 +6317,22 @@ class VLMBatchedEngine(BaseEngine):
         )
         return list(token_ids)
 
-    def has_active_requests(self) -> bool:
-        """Check if the engine has active in-flight requests."""
+    def active_request_count(self) -> int:
+        """Number of in-flight requests across speech, diffusion and text."""
         if getattr(self, "_speech_active", 0):
-            return True
+            return int(self._speech_active)
         if self.is_diffusion_model:
-            return getattr(self, "_diffusion_active_requests", 0) > 0
+            return int(getattr(self, "_diffusion_active_requests", 0))
         engine_core = getattr(self, "_engine", None)
         if engine_core is not None:
             inner = getattr(engine_core, "engine", None)
             if inner is not None:
-                collectors = getattr(inner, "_output_collectors", {})
-                return len(collectors) > 0
-        return False
+                return len(getattr(inner, "_output_collectors", {}))
+        return 0
+
+    def has_active_requests(self) -> bool:
+        """Check if the engine has active in-flight requests."""
+        return self.active_request_count() > 0
 
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""

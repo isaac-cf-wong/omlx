@@ -65,7 +65,9 @@ from .exceptions import (
     ModelTooLargeError,
     ModelUnavailableError,
     describe_ceiling_binding,
+    is_metal_out_of_memory,
 )
+from .lora_adapters import adapter_info
 from .model_discovery import (
     VLM_NATIVE_TEXT_MODEL_TYPES,
     detect_model_type,
@@ -81,9 +83,14 @@ from .model_settings import (
     ane_prefill_fraction,
     validate_ane_prefill,
 )
+from .patches.inkling2 import INKLING2_MODEL_TYPES
+from .patches.inkling2.dspark import (
+    bundled_inkling2_dspark_path,
+    load_inkling2_dspark_drafter,
+)
 from .patches.minimax_m3_dspark import bundled_dspark_path, load_minimax_dspark_drafter
 from .patches.qwen35_yarn import yarn_factor
-from .prefill_helper.adapters import adapter_for as prefill_stage_adapter
+from .prefill_helper.adapters import adapter_for_model as prefill_stage_adapter
 from .prefill_helper.lending import lending_note
 from .prefill_helper.manager import prepare as prepare_prefill_helper
 from .scheduler import SchedulerConfig
@@ -309,22 +316,6 @@ def _settled_phys_footprint() -> int:
     return max(0, get_phys_footprint() - unreleased_graphics_bytes(mlx_bytes))
 
 
-def _is_metal_out_of_memory(exc: BaseException | None) -> bool:
-    # Track visited exceptions: a cause chain can loop (an exception raised
-    # ``from`` itself), and this runs on the event loop during a failed load.
-    seen: set[int] = set()
-    while exc is not None and id(exc) not in seen:
-        seen.add(id(exc))
-        text = str(exc)
-        if (
-            "kIOGPUCommandBufferCallbackErrorOutOfMemory" in text
-            or "Insufficient Memory" in text
-        ):
-            return True
-        exc = exc.__cause__
-    return False
-
-
 def _set_concurrency_limits(config: object, value: int) -> None:
     config.max_num_seqs = value
     config.completion_batch_size = value
@@ -467,6 +458,8 @@ class EnginePool:
         self._starting_external: dict[str, SplashEngine] = {}
         # Scanned model roots, kept for org-qualified display/upload names.
         self._model_dirs: list[Path] = []
+        # LoRA adapter folders found in the model roots, by adapter id.
+        self._lora_adapters: dict[str, str] = {}
         self._scheduler_config = scheduler_config or SchedulerConfig()
         self._process_memory_enforcer: object | None = None  # Set by server
         self._get_final_ceiling: object | None = None  # Set by server
@@ -497,12 +490,25 @@ class EnginePool:
         # Idle GPU keep-warm ticker (see _touch_gpu). Configured by the server
         # from ServerSettings.gpu_keep_warm_interval; started on first load.
         self._gpu_keep_warm_interval: float = 0.0
+        self._gpu_keep_warm_idle_window: float = _GPU_KEEP_WARM_IDLE_WINDOW_S
         self._gpu_keep_warm_task: asyncio.Task[None] | None = None
         self._gpu_keep_warm_last_active = 0.0
         self.configure_hot_cache_budget()
 
-    def configure_gpu_keep_warm(self, interval_seconds: float) -> None:
-        """Set the idle keep-warm period in seconds (0 or less disables it)."""
+    def configure_gpu_keep_warm(
+        self, interval_seconds: float, idle_window_seconds: float | None = None
+    ) -> None:
+        """Set the idle keep-warm period in seconds (0 or less disables it).
+
+        ``idle_window_seconds`` is how long after the last request the ticks
+        keep running; None keeps the current window.
+        """
+        if idle_window_seconds is not None:
+            try:
+                window = float(idle_window_seconds)
+            except (TypeError, ValueError):
+                window = _GPU_KEEP_WARM_IDLE_WINDOW_S
+            self._gpu_keep_warm_idle_window = max(0.0, window)
         try:
             interval = float(interval_seconds or 0.0)
         except (TypeError, ValueError):
@@ -537,7 +543,7 @@ class EnginePool:
                 return False
             # Leases refresh last_access at both request start and completion.
             last_request = max(last_request, entry.last_access)
-        return loaded and now - last_request < _GPU_KEEP_WARM_IDLE_WINDOW_S
+        return loaded and now - last_request < self._gpu_keep_warm_idle_window
 
     async def _gpu_keep_warm_loop(self) -> None:
         loop = asyncio.get_running_loop()
@@ -720,6 +726,17 @@ class EnginePool:
             dspark_path = bundled_dspark_path(entry.model_path)
             if dspark_path is not None:
                 extra += self._dflash_drafter_estimated_bytes(str(dspark_path), None)
+        elif (
+            getattr(runtime_settings, "mtp_enabled", False)
+            and entry.config_model_type in INKLING2_MODEL_TYPES
+        ):
+            draft = bundled_inkling2_dspark_path(entry.model_path)
+            if draft is not None:
+                # BF16 draft weights plus the folded [vocab, rank] Markov head.
+                extra += draft.stat().st_size + 201024 * 256 * 2
+        lora_path = getattr(runtime_settings, "lora_adapter", None)
+        if lora_path and (info := adapter_info(lora_path)) is not None:
+            extra += info.resident_bytes
         return base + extra
 
     def _dflash_drafter_estimated_bytes(
@@ -1475,6 +1492,8 @@ class EnginePool:
             add("vlm_mtp_draft_model", data.get("vlm_mtp_draft_model"))
             add("vlm_mtp_draft_block_size", data.get("vlm_mtp_draft_block_size"))
 
+        add("lora_adapter", data.get("lora_adapter") or None)
+
         return tuple(signature)
 
     @property
@@ -1555,7 +1574,9 @@ class EnginePool:
         self._model_dirs = dirs
 
         gguf_root = _gguf_model_root()
-        discovered = discover_models_from_dirs(dirs, gguf_root)
+        adapters: dict[str, str] = {}
+        discovered = discover_models_from_dirs(dirs, gguf_root, adapters)
+        self._lora_adapters = adapters
 
         pinned_set = set(pinned_models or [])
 
@@ -1623,6 +1644,10 @@ class EnginePool:
                 logger.warning(f"Pinned model not found: {model_id}")
 
         logger.info(f"Discovered {len(self._entries)} models")
+
+    def lora_adapters(self) -> dict[str, str]:
+        """LoRA adapter folders found in the model roots, by adapter id."""
+        return dict(self._lora_adapters)
 
     _MODEL_TYPE_TO_ENGINE: dict[str, str] = {
         "llm": "batched",
@@ -2387,6 +2412,7 @@ class EnginePool:
                 max_context=requested_context,
                 max_memory_bytes=budget,
                 kv_format=integrations.splash_kv_format,
+                activations=integrations.splash_activations,
                 ane_prefill=integrations.splash_ane_prefill,
                 cache_disk_bytes=cache_disk_bytes,
                 cache_dir=cache_dir,
@@ -2411,7 +2437,9 @@ class EnginePool:
         """Start the chosen Prefill Accelerator while this Mac loads the model."""
         node_id = getattr(settings, "prefill_helper_node_id", None)
         model_type = (entry.config_model_type or "").replace("-", "_").lower()
-        adapter = prefill_stage_adapter(model_type)
+        adapter = prefill_stage_adapter(
+            entry.config_model_type, entry.engine_type, entry.model_path
+        )
         if node_id is None or adapter is None:
             return False
         prepare_prefill_helper(
@@ -3259,7 +3287,7 @@ class EnginePool:
         evicted_any = False
         evicted_count = 0
         reclaim_attempted = False
-        slots_release_attempted = False
+        slots_exhausted = False
         slots_freed = 0
         ane_release_attempted = False
         hot_cache_attempted = False
@@ -3334,15 +3362,17 @@ class EnginePool:
                     )
                     continue
 
-                if not slots_release_attempted:
+                if not slots_exhausted:
                     # The requesting model's MoE offload slots return at its next
                     # decode step, so they go before cached prefixes and models.
-                    slots_release_attempted = True
-                    slots_freed = await self._release_offload_slots_for_headroom(
-                        exclude_model_id, request_id
+                    # Sized passes repeat until the step fits or the floor.
+                    released = await self._release_offload_slots_for_headroom(
+                        exclude_model_id, request_id, current + predicted - target
                     )
-                    if slots_freed:
+                    if released:
+                        slots_freed += released
                         continue
+                    slots_exhausted = True
 
                 if not hot_cache_attempted:
                     # Cached prefix blocks give way before any model does.
@@ -3564,9 +3594,10 @@ class EnginePool:
         return freed
 
     async def _release_offload_slots_for_headroom(
-        self, model_id: str, request_id: str
+        self, model_id: str, request_id: str, shortfall: int
     ) -> int:
-        """Release the model's MoE offload slots on its MLX thread; return the bytes."""
+        """Release ``shortfall`` bytes of the model's MoE offload slots, rounded up
+        to the next release step, on its MLX thread; return the bytes."""
         entry = self._entries.get(model_id)
         engine = entry.engine if entry is not None else None
         core = (
@@ -3581,7 +3612,9 @@ class EnginePool:
             return 0
         loop = asyncio.get_running_loop()
         try:
-            released = await loop.run_in_executor(executor, release, request_id)
+            released = await loop.run_in_executor(
+                executor, release, request_id, shortfall
+            )
         except Exception as e:
             logger.warning(
                 "MoE offload slot release failed for prefill request %s: %s",
@@ -4152,6 +4185,13 @@ class EnginePool:
                 validate_ane_prefill(model_settings.to_dict(), entry.config_model_type)
 
             deployment = self._distributed_deployment_for_entry(entry)
+            if getattr(model_settings, "lora_adapter", None) and (
+                deployment is not None or effective_type not in ("batched", "vlm")
+            ):
+                raise ValueError(
+                    "A LoRA adapter applies only to a language or vision-language "
+                    f"model served on this Mac; remove it from {model_id}'s settings"
+                )
             base_resident_size = self._entry_resident_size(entry)
             if (
                 deployment is None
@@ -4533,6 +4573,34 @@ class EnginePool:
                     else:
                         engine.set_dflash_drafter(drafter)
 
+            # Inkling 2 bundles its DSpark draft as mtp.safetensors.
+            if (
+                model_settings is not None
+                and getattr(model_settings, "mtp_enabled", False)
+                and entry.config_model_type in INKLING2_MODEL_TYPES
+                and hasattr(engine, "prepare_dflash_target")
+            ):
+                draft_path = bundled_inkling2_dspark_path(entry.model_path)
+                fixed = getattr(model_settings, "mtp_fixed_depth", None)
+                depth = fixed or getattr(model_settings, "mtp_adaptive_max_depth", None)
+                if draft_path is not None:
+                    try:
+                        drafter = await asyncio.get_running_loop().run_in_executor(
+                            get_mlx_executor(),
+                            load_inkling2_dspark_drafter,
+                            entry.model_path,
+                            engine.prepare_dflash_target(),
+                            depth,
+                            bool(fixed),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Inkling 2 DSpark drafter load raised for {model_id}: "
+                            f"{e} -- Lightning MTP stays off"
+                        )
+                    else:
+                        engine.set_dflash_drafter(drafter)
+
             # VLM MTP: load MTP drafter (gemma4_assistant or qwen3_5_mtp) and attach to engine.
             # Fail-soft -- drafter load issues never block the target engine.
             if (
@@ -4662,7 +4730,7 @@ class EnginePool:
             if (
                 not entry.abort_loading
                 and not entry_detached
-                and _is_metal_out_of_memory(exc)
+                and is_metal_out_of_memory(exc)
             ):
                 # Depends on what else is resident, so do not cache it: a retry
                 # after memory is freed can succeed with the same files.
